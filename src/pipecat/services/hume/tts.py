@@ -1,4 +1,4 @@
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 
@@ -16,7 +16,6 @@ from pipecat import version as pipecat_version
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
-    ErrorFrame,
     Frame,
     InterruptionFrame,
     StartFrame,
@@ -210,11 +209,12 @@ class HumeTTSService(WordTTSService):
             await super().update_setting(key, value)
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Hume TTS with word timestamps.
 
         Args:
             text: The text to be synthesized.
+            context_id: Unique identifier for this TTS context.
 
         Returns:
             An async generator that yields `Frame` objects, including
@@ -246,7 +246,7 @@ class HumeTTSService(WordTTSService):
         # Start TTS sequence if not already started
         if not self._started:
             await self.start_word_timestamps()
-            yield TTSStartedFrame()
+            yield TTSStartedFrame(context_id=context_id)
             self._started = True
 
         try:
@@ -282,6 +282,7 @@ class HumeTTSService(WordTTSService):
                             audio=self._audio_bytes,
                             sample_rate=self.sample_rate,
                             num_channels=1,
+                            context_id=context_id,
                         )
                         yield frame
                         self._audio_bytes = b""
@@ -298,7 +299,9 @@ class HumeTTSService(WordTTSService):
                         utterance_duration = max(utterance_duration, word_end_time)
 
                         # Add word timestamp
-                        await self.add_word_timestamps([(timestamp.text, word_start_time)])
+                        await self.add_word_timestamps(
+                            [(timestamp.text, word_start_time)], context_id
+                        )
 
             # Flush any remaining audio bytes
             if self._audio_bytes:
@@ -306,6 +309,7 @@ class HumeTTSService(WordTTSService):
                     audio=self._audio_bytes,
                     sample_rate=self.sample_rate,
                     num_channels=1,
+                    context_id=context_id,
                 )
 
                 yield frame

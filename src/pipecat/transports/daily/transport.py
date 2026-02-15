@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -27,7 +27,6 @@ from pipecat.frames.frames import (
     CancelFrame,
     ControlFrame,
     EndFrame,
-    ErrorFrame,
     Frame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
@@ -760,7 +759,11 @@ class DailyTransportClient(EventHandler):
             # Increment leave counter if we successfully joined.
             self._leave_counter += 1
 
-            logger.info(f"Joined {self._room_url}")
+            participant_id = data.get("participants", {}).get("local", {}).get("id")
+            meeting_id = data.get("meetingSession", {}).get("id")
+            logger.info(
+                f"Joined {self._room_url}. Participant ID: {participant_id}, Meeting ID: {meeting_id}"
+            )
 
             await self._callbacks.on_joined(data)
 
@@ -808,6 +811,11 @@ class DailyTransportClient(EventHandler):
                     "camera": {
                         "sendSettings": {
                             "maxQuality": "low",
+                            **(
+                                {"preferredCodec": self._params.video_out_codec}
+                                if self._params.video_out_codec
+                                else {}
+                            ),
                             "encodings": {
                                 "low": {
                                     "maxBitrate": self._params.video_out_bitrate,
@@ -1725,8 +1733,9 @@ class DailyInputTransport(BaseInputTransport):
             message: The message data to send.
             sender: ID of the message sender.
         """
-        frame = DailyInputTransportMessageFrame(message=message, participant_id=sender)
-        await self.push_frame(frame)
+        await self.broadcast_frame(
+            DailyInputTransportMessageFrame, message=message, participant_id=sender
+        )
 
     #
     # Audio in
@@ -1844,7 +1853,6 @@ class DailyInputTransport(BaseInputTransport):
                 format=video_frame.color_format,
                 text=request_frame.text if request_frame else None,
                 append_to_context=request_frame.append_to_context if request_frame else None,
-                # Deprecated fields below.
                 request=request_frame,
             )
             frame.transport_source = video_source
@@ -2031,6 +2039,61 @@ class DailyTransport(BaseTransport):
     Provides comprehensive Daily integration including audio/video streaming,
     transcription, recording, dial-in/out functionality, and real-time communication
     features for conversational AI applications.
+
+    Event handlers available:
+
+    - on_joined: Called when the bot joins the room. Args: (data: dict)
+    - on_left: Called when the bot leaves the room.
+    - on_before_leave: [sync] Called just before the bot leaves the room.
+    - on_error: Called when a transport error occurs. Args: (error: str)
+    - on_call_state_updated: Called when the call state changes. Args: (state: str)
+    - on_first_participant_joined: Called when the first participant joins.
+      Args: (participant: dict)
+    - on_participant_joined: Called when any participant joins.
+      Args: (participant: dict)
+    - on_participant_left: Called when a participant leaves.
+      Args: (participant: dict, reason: str)
+    - on_participant_updated: Called when a participant's state changes.
+      Args: (participant: dict)
+    - on_client_connected: Called when a participant connects (alias for
+      on_participant_joined). Args: (participant: dict)
+    - on_client_disconnected: Called when a participant disconnects (alias for
+      on_participant_left). Args: (participant: dict)
+    - on_active_speaker_changed: Called when the active speaker changes.
+      Args: (participant: dict)
+    - on_app_message: Called when an app message is received.
+      Args: (message: Any, sender: str)
+    - on_transcription_message: Called when a transcription message is received.
+      Args: (message: dict)
+    - on_recording_started: Called when recording starts. Args: (status: str)
+    - on_recording_stopped: Called when recording stops. Args: (stream_id: str)
+    - on_recording_error: Called when a recording error occurs.
+      Args: (stream_id: str, message: str)
+    - on_dialin_connected: Called when a dial-in call connects. Args: (data: dict)
+    - on_dialin_ready: Called when the SIP endpoint is ready.
+      Args: (sip_endpoint: str)
+    - on_dialin_stopped: Called when a dial-in call stops. Args: (data: dict)
+    - on_dialin_error: Called when a dial-in error occurs. Args: (data: dict)
+    - on_dialin_warning: Called when a dial-in warning occurs. Args: (data: dict)
+    - on_dialout_answered: Called when a dial-out call is answered. Args: (data: dict)
+    - on_dialout_connected: Called when a dial-out call connects. Args: (data: dict)
+    - on_dialout_stopped: Called when a dial-out call stops. Args: (data: dict)
+    - on_dialout_error: Called when a dial-out error occurs. Args: (data: dict)
+    - on_dialout_warning: Called when a dial-out warning occurs. Args: (data: dict)
+
+    Example::
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(transport, participant):
+            await task.queue_frame(TTSSpeakFrame("Hello!"))
+
+        @transport.event_handler("on_participant_left")
+        async def on_participant_left(transport, participant, reason):
+            await task.queue_frame(EndFrame())
+
+        @transport.event_handler("on_app_message")
+        async def on_app_message(transport, message, sender):
+            logger.info(f"Message from {sender}: {message}")
     """
 
     def __init__(

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -28,8 +28,11 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
     TranslationFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.services.gladia.config import GladiaInputParams
+from pipecat.services.stt_latency import GLADIA_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.time import time_now_iso8601
@@ -202,6 +205,8 @@ class GladiaSTTService(WebsocketSTTService):
         model: str = "solaria-1",
         params: Optional[GladiaInputParams] = None,
         max_buffer_size: int = 1024 * 1024 * 20,  # 20MB default buffer
+        should_interrupt: bool = True,
+        ttfs_p99_latency: Optional[float] = GLADIA_TTFS_P99,
         **kwargs,
     ):
         """Initialize the Gladia STT service.
@@ -220,9 +225,19 @@ class GladiaSTTService(WebsocketSTTService):
             model: Model to use for transcription. Defaults to "solaria-1".
             params: Additional configuration parameters for Gladia service.
             max_buffer_size: Maximum size of audio buffer in bytes. Defaults to 20MB.
+            should_interrupt: Determine whether the bot should be interrupted when
+                Gladia VAD detects user speech. Defaults to True.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+                Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to the STTService parent class.
         """
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            keepalive_timeout=20,
+            keepalive_interval=5,
+            **kwargs,
+        )
 
         params = params or GladiaInputParams()
 
@@ -252,7 +267,6 @@ class GladiaSTTService(WebsocketSTTService):
         self.set_model_name(model)
         self._params = params
         self._receive_task = None
-        self._keepalive_task = None
         self._settings = {}
 
         # Session management
@@ -265,6 +279,10 @@ class GladiaSTTService(WebsocketSTTService):
         self._bytes_sent = 0
         self._max_buffer_size = max_buffer_size
         self._buffer_lock = asyncio.Lock()
+
+        # VAD state tracking
+        self._is_speaking = False
+        self._should_interrupt = should_interrupt
 
     def __str__(self):
         return f"{self.name} [{self._session_id}]"
@@ -376,7 +394,6 @@ class GladiaSTTService(WebsocketSTTService):
         Yields:
             None (processing is handled asynchronously via WebSocket).
         """
-        await self.start_ttfb_metrics()
         await self.start_processing_metrics()
 
         # Add audio to buffer
@@ -414,22 +431,19 @@ class GladiaSTTService(WebsocketSTTService):
 
         await self._connect_websocket()
 
+        await super()._connect()
+
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
-
-        if self._websocket and not self._keepalive_task:
-            self._keepalive_task = self.create_task(self._keepalive_task_handler())
 
     async def _disconnect(self):
         """Disconnect from the Gladia service.
 
         Cleans up tasks and closes websocket connection.
         """
-        self._connection_active = False
+        await super()._disconnect()
 
-        if self._keepalive_task:
-            await self.cancel_task(self._keepalive_task)
-            self._keepalive_task = None
+        self._connection_active = False
 
         if self._receive_task:
             await self.cancel_task(self._receive_task)
@@ -500,8 +514,34 @@ class GladiaSTTService(WebsocketSTTService):
     async def _handle_transcription(
         self, transcript: str, is_final: bool, language: Optional[str] = None
     ):
-        await self.stop_ttfb_metrics()
         await self.stop_processing_metrics()
+
+    async def _on_speech_started(self):
+        """Handle speech start event from Gladia.
+
+        Broadcasts UserStartedSpeakingFrame and optionally triggers interruption
+        when VAD is enabled.
+        """
+        if not self._params.enable_vad or self._is_speaking:
+            return
+
+        logger.debug(f"{self} User started speaking")
+        self._is_speaking = True
+
+        await self.broadcast_frame(UserStartedSpeakingFrame)
+        if self._should_interrupt:
+            await self.push_interruption_task_frame_and_wait()
+
+    async def _on_speech_ended(self):
+        """Handle speech end event from Gladia.
+
+        Broadcasts UserStoppedSpeakingFrame when VAD is enabled.
+        """
+        if not self._params.enable_vad or not self._is_speaking:
+            return
+        self._is_speaking = False
+        await self.broadcast_frame(UserStoppedSpeakingFrame)
+        logger.debug(f"{self} User stopped speaking")
 
     async def _send_audio(self, audio: bytes):
         """Send audio chunk with proper message format."""
@@ -595,24 +635,17 @@ class GladiaSTTService(WebsocketSTTService):
                                 translation, "", time_now_iso8601(), translated_language
                             )
                         )
+                elif content["type"] == "speech_start":
+                    await self._on_speech_started()
+                elif content["type"] == "speech_end":
+                    await self._on_speech_ended()
             except json.JSONDecodeError:
                 logger.warning(f"{self} Received non-JSON message: {message}")
 
-    async def _keepalive_task_handler(self):
-        """Send periodic empty audio chunks to keep the connection alive."""
-        try:
-            KEEPALIVE_SLEEP = 20
-            while self._connection_active:
-                # Send keepalive (Gladia times out after 30 seconds)
-                await asyncio.sleep(KEEPALIVE_SLEEP)
-                if self._websocket and self._websocket.state is State.OPEN:
-                    # Send an empty audio chunk as keepalive
-                    empty_audio = b""
-                    await self._send_audio(empty_audio)
-                else:
-                    logger.debug(f"{self} Websocket closed, stopping keepalive")
-                    break
-        except websockets.exceptions.ConnectionClosed:
-            logger.debug(f"{self} Connection closed during keepalive")
-        except Exception as e:
-            await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
+    async def _send_keepalive(self, silence: bytes):
+        """Send an empty audio chunk to keep the Gladia connection alive.
+
+        Args:
+            silence: Silent PCM audio bytes (unused, Gladia accepts empty chunks).
+        """
+        await self._send_audio(b"")

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -46,7 +46,7 @@ def detect_device():
                and dtype is the recommended torch data type for that device.
     """
     try:
-        import intel_extension_for_pytorch
+        import intel_extension_for_pytorch  # noqa: F401
 
         if torch.xpu.is_available():
             return torch.device("xpu"), torch.float32

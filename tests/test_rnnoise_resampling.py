@@ -1,4 +1,9 @@
-import asyncio
+#
+# Copyright (c) 2024-2026, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -127,3 +132,7 @@ class TestRNNoiseResampling(unittest.IsolatedAsyncioTestCase):
             )
 
         print("Test Passed: Resampling logic verified (with mocked RNNoise).")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024-2025 Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -792,3 +792,7 @@ class TestThoughtTranscription(unittest.IsolatedAsyncioTestCase):
 
         # Verify no updates since thought wasn't properly started
         self.assertEqual(len(received_updates), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

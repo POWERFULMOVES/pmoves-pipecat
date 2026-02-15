@@ -37,7 +37,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv sync --group dev --extra anthropic --extra aws --extra google --extra langchain
+          uv sync --group dev \
+            --extra anthropic \
+            --extra aws \
+            --extra google \
+            --extra langchain \
+            --extra livekit \
+            --extra local-smart-turn-v3 \
+            --extra piper \
+            --extra tracing \
+            --extra websocket
 
       - name: Test with pytest
         run: |

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -661,6 +661,17 @@ class TavusTransport(BaseTransport):
     When used, the Pipecat bot joins the same virtual room as the Tavus Avatar and the user.
     This is achieved by using `TavusTransportClient`, which initiates the conversation via
     `TavusApi` and obtains a room URL that all participants connect to.
+
+    Event handlers available:
+
+    - on_client_connected(transport, participant): Participant connected to the session
+    - on_client_disconnected(transport, participant): Participant disconnected from the session
+
+    Example::
+
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, participant):
+            ...
     """
 
     def __init__(

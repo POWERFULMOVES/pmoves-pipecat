@@ -1,3 +1,9 @@
+#
+# Copyright (c) 2024-2026, Daily
+#
+# SPDX-License-Identifier: BSD 2-Clause License
+#
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -503,3 +509,7 @@ async def test_aws_bedrock_run_inference_client_exception():
     with patch.object(service._aws_session, "client", return_value=mock_context_manager):
         with pytest.raises(Exception, match="Bedrock API Error"):
             await service.run_inference(mock_context)
+
+
+if __name__ == "__main__":
+    unittest.main()

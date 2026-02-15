@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 import aiohttp
 from loguru import logger
-from openai.types import chat as openai_chat_types
 from pydantic import BaseModel, Field
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
@@ -43,6 +42,7 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
     TTSTextFrame,
     UserAudioRawFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response import (
@@ -340,6 +340,13 @@ class UltravoxRealtimeLLMService(LLMService):
         elif isinstance(frame, InputAudioRawFrame):
             await self._send_user_audio(frame)
             await self.push_frame(frame, direction)
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            # This may or may not align with Ultravox's end of user speech detection,
+            # which relies on a more complex endpointing model. In particular it will
+            # yield a seemingly very slow TTFB in the case of endpointing false
+            # negatives. It will be close in the majority of cases though.
+            await self.start_ttfb_metrics()
+            await self.push_frame(frame, direction)
         else:
             await self.push_frame(frame, direction)
 
@@ -462,6 +469,7 @@ class UltravoxRealtimeLLMService(LLMService):
         if not audio:
             return
         if not self._bot_responding:
+            await self.stop_ttfb_metrics()
             await self.push_frame(LLMFullResponseStartFrame())
             await self.push_frame(TTSStartedFrame())
             self._bot_responding = "voice"
@@ -507,6 +515,7 @@ class UltravoxRealtimeLLMService(LLMService):
             await self.push_frame(frame)
         if medium == "text":
             if text:
+                await self.stop_ttfb_metrics()
                 await self.push_frame(LLMFullResponseStartFrame())
                 await self.push_frame(TTSStartedFrame())
                 await self.push_frame(TTSTextFrame(text=text, aggregated_by=AggregationType.WORD))
@@ -541,7 +550,13 @@ class UltravoxRealtimeLLMService(LLMService):
 
         Returns:
             A pair of user and assistant context aggregators.
+
+        .. deprecated:: 0.0.99
+            `create_context_aggregator()` is deprecated and will be removed in a future version.
+            Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+            See `OpenAILLMContext` docstring for migration guide.
         """
+        # from_openai_context handles deprecation warning
         context = LLMContext.from_openai_context(context)
         assistant_params.expect_stripped_words = False
         return LLMContextAggregatorPair(

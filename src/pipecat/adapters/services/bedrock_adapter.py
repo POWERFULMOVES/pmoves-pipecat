@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -10,7 +10,7 @@ import base64
 import copy
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 from loguru import logger
 

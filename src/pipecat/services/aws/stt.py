@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -10,7 +10,6 @@ This module provides a WebSocket-based connection to AWS Transcribe for real-tim
 speech-to-text transcription with support for multiple languages and audio formats.
 """
 
-import asyncio
 import json
 import os
 import random
@@ -29,6 +28,7 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
 )
 from pipecat.services.aws.utils import build_event_message, decode_event, get_presigned_url
+from pipecat.services.stt_latency import AWS_TRANSCRIBE_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.time import time_now_iso8601
@@ -60,6 +60,7 @@ class AWSTranscribeSTTService(WebsocketSTTService):
         region: Optional[str] = None,
         sample_rate: int = 16000,
         language: Language = Language.EN,
+        ttfs_p99_latency: Optional[float] = AWS_TRANSCRIBE_TTFS_P99,
         **kwargs,
     ):
         """Initialize the AWS Transcribe STT service.
@@ -71,9 +72,11 @@ class AWSTranscribeSTTService(WebsocketSTTService):
             region: AWS region for the service.
             sample_rate: Audio sample rate in Hz. Must be 8000 or 16000. Defaults to 16000.
             language: Language for transcription. Defaults to English.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+                Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
             **kwargs: Additional arguments passed to parent STTService class.
         """
-        super().__init__(**kwargs)
+        super().__init__(ttfs_p99_latency=ttfs_p99_latency, **kwargs)
 
         self._settings = {
             "sample_rate": sample_rate,
@@ -159,7 +162,6 @@ class AWSTranscribeSTTService(WebsocketSTTService):
                 await self._websocket.send(event_message)
                 # Start metrics after first chunk sent
                 await self.start_processing_metrics()
-                await self.start_ttfb_metrics()
             except Exception as e:
                 yield ErrorFrame(error=f"Error sending audio: {e}")
 
@@ -170,6 +172,8 @@ class AWSTranscribeSTTService(WebsocketSTTService):
 
         Establishes websocket connection and starts receive task.
         """
+        await super()._connect()
+
         await self._connect_websocket()
 
         if self._websocket and not self._receive_task:
@@ -180,6 +184,8 @@ class AWSTranscribeSTTService(WebsocketSTTService):
 
         Sends end-stream message and cleans up.
         """
+        await super()._disconnect()
+
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
@@ -467,7 +473,6 @@ class AWSTranscribeSTTService(WebsocketSTTService):
                             is_final = not result.get("IsPartial", True)
 
                             if transcript:
-                                await self.stop_ttfb_metrics()
                                 if is_final:
                                     await self.push_frame(
                                         TranscriptionFrame(

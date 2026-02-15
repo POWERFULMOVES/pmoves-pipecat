@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -213,12 +213,14 @@ class CartesiaTTSService(AudioContextWordTTSService):
 
             generation_config: Generation configuration for Sonic-3 models. Includes volume,
                 speed (numeric), and emotion (string) parameters.
+            pronunciation_dict_id: The ID of the pronunciation dictionary to use for custom pronunciations.
         """
 
         language: Optional[Language] = Language.EN
         speed: Optional[Literal["slow", "normal", "fast"]] = None
         emotion: Optional[List[str]] = []
         generation_config: Optional[GenerationConfig] = None
+        pronunciation_dict_id: Optional[str] = None
 
     def __init__(
         self,
@@ -296,10 +298,11 @@ class CartesiaTTSService(AudioContextWordTTSService):
             },
             "language": self.language_to_service_language(params.language)
             if params.language
-            else "en",
+            else None,
             "speed": params.speed,
             "emotion": params.emotion,
             "generation_config": params.generation_config,
+            "pronunciation_dict_id": params.pronunciation_dict_id,
         }
         self.set_model_name(model)
         self.set_voice(voice_id)
@@ -389,10 +392,10 @@ class CartesiaTTSService(AudioContextWordTTSService):
         Returns:
             List of (word, start_time) tuples processed for the language.
         """
-        current_language = self._settings.get("language", "en")
+        current_language = self._settings.get("language")
 
-        # Check if this is a CJK language
-        if self._is_cjk_language(current_language):
+        # Check if this is a CJK language (if language is None, treat as non-CJK)
+        if current_language and self._is_cjk_language(current_language):
             # For CJK languages, combine all characters in this message into one word
             # using the first character's start time
             if words and starts:
@@ -431,10 +434,12 @@ class CartesiaTTSService(AudioContextWordTTSService):
             "model_id": self.model_name,
             "voice": voice_config,
             "output_format": self._settings["output_format"],
-            "language": self._settings["language"],
             "add_timestamps": add_timestamps,
             "use_original_timestamps": False if self.model_name == "sonic" else True,
         }
+
+        if self._settings["language"]:
+            msg["language"] = self._settings["language"]
 
         if self._settings["speed"]:
             msg["speed"] = self._settings["speed"]
@@ -443,6 +448,9 @@ class CartesiaTTSService(AudioContextWordTTSService):
             msg["generation_config"] = self._settings["generation_config"].model_dump(
                 exclude_none=True
             )
+
+        if self._settings["pronunciation_dict_id"]:
+            msg["pronunciation_dict_id"] = self._settings["pronunciation_dict_id"]
 
         return json.dumps(msg)
 
@@ -475,12 +483,16 @@ class CartesiaTTSService(AudioContextWordTTSService):
         await self._disconnect()
 
     async def _connect(self):
+        await super()._connect()
+
         await self._connect_websocket()
 
         if self._websocket and not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
     async def _disconnect(self):
+        await super()._disconnect()
+
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
@@ -528,6 +540,20 @@ class CartesiaTTSService(AudioContextWordTTSService):
             await self._get_websocket().send(cancel_msg)
             self._context_id = None
 
+    def create_context_id(self) -> str:
+        """Generate a unique context ID for a TTS request in case we don't have one already in progress.
+
+        Returns:
+            A unique string identifier for the TTS context.
+        """
+        # If a context ID does not exist, create a new one.
+        # If an ID exists, continue using the current ID.
+        # When interruptions happen, user speech results in
+        # an interruption, which resets the context ID.
+        if not self._context_id:
+            return str(uuid.uuid4())
+        return self._context_id
+
     async def flush_audio(self):
         """Flush any pending audio and finalize the current context."""
         if not self._context_id or not self._websocket:
@@ -542,16 +568,17 @@ class CartesiaTTSService(AudioContextWordTTSService):
             msg = json.loads(message)
             if not msg or not self.audio_context_available(msg["context_id"]):
                 continue
+            ctx_id = msg["context_id"]
             if msg["type"] == "done":
                 await self.stop_ttfb_metrics()
-                await self.add_word_timestamps([("TTSStoppedFrame", 0), ("Reset", 0)])
-                await self.remove_audio_context(msg["context_id"])
+                await self.add_word_timestamps([("TTSStoppedFrame", 0), ("Reset", 0)], ctx_id)
+                await self.remove_audio_context(ctx_id)
             elif msg["type"] == "timestamps":
                 # Process the timestamps based on language before adding them
                 processed_timestamps = self._process_word_timestamps_for_language(
                     msg["word_timestamps"]["words"], msg["word_timestamps"]["start"]
                 )
-                await self.add_word_timestamps(processed_timestamps)
+                await self.add_word_timestamps(processed_timestamps, ctx_id)
             elif msg["type"] == "chunk":
                 await self.stop_ttfb_metrics()
                 await self.start_word_timestamps()
@@ -559,10 +586,11 @@ class CartesiaTTSService(AudioContextWordTTSService):
                     audio=base64.b64decode(msg["data"]),
                     sample_rate=self.sample_rate,
                     num_channels=1,
+                    context_id=ctx_id,
                 )
-                await self.append_to_audio_context(msg["context_id"], frame)
+                await self.append_to_audio_context(ctx_id, frame)
             elif msg["type"] == "error":
-                await self.push_frame(TTSStoppedFrame())
+                await self.push_frame(TTSStoppedFrame(context_id=ctx_id))
                 await self.stop_all_metrics()
                 await self.push_error(error_msg=f"Error: {msg}")
                 self._context_id = None
@@ -578,11 +606,12 @@ class CartesiaTTSService(AudioContextWordTTSService):
             await self._connect_websocket()
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Cartesia's streaming API.
 
         Args:
             text: The text to synthesize into speech.
+            context_id: The context ID for tracking audio frames.
 
         Yields:
             Frame: Audio frames containing the synthesized speech.
@@ -595,8 +624,8 @@ class CartesiaTTSService(AudioContextWordTTSService):
 
             if not self._context_id:
                 await self.start_ttfb_metrics()
-                yield TTSStartedFrame()
-                self._context_id = str(uuid.uuid4())
+                yield TTSStartedFrame(context_id=context_id)
+                self._context_id = context_id
                 await self.create_audio_context(self._context_id)
 
             msg = self._build_msg(text=text)
@@ -606,7 +635,7 @@ class CartesiaTTSService(AudioContextWordTTSService):
                 await self.start_tts_usage_metrics(text)
             except Exception as e:
                 yield ErrorFrame(error=f"Unknown error occurred: {e}")
-                yield TTSStoppedFrame()
+                yield TTSStoppedFrame(context_id=context_id)
                 await self._disconnect()
                 await self._connect()
                 return
@@ -636,12 +665,14 @@ class CartesiaHttpTTSService(TTSService):
 
             generation_config: Generation configuration for Sonic-3 models. Includes volume,
                 speed (numeric), and emotion (string) parameters.
+            pronunciation_dict_id: The ID of the pronunciation dictionary to use for custom pronunciations.
         """
 
         language: Optional[Language] = Language.EN
         speed: Optional[Literal["slow", "normal", "fast"]] = None
         emotion: Optional[List[str]] = Field(default_factory=list)
         generation_config: Optional[GenerationConfig] = None
+        pronunciation_dict_id: Optional[str] = None
 
     def __init__(
         self,
@@ -686,10 +717,11 @@ class CartesiaHttpTTSService(TTSService):
             },
             "language": self.language_to_service_language(params.language)
             if params.language
-            else "en",
+            else None,
             "speed": params.speed,
             "emotion": params.emotion,
             "generation_config": params.generation_config,
+            "pronunciation_dict_id": params.pronunciation_dict_id,
         }
         self.set_voice(voice_id)
         self.set_model_name(model)
@@ -746,11 +778,12 @@ class CartesiaHttpTTSService(TTSService):
         await self._client.close()
 
     @traced_tts
-    async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
         """Generate speech from text using Cartesia's HTTP API.
 
         Args:
             text: The text to synthesize into speech.
+            context_id: The context ID for tracking audio frames.
 
         Yields:
             Frame: Audio frames containing the synthesized speech.
@@ -777,8 +810,10 @@ class CartesiaHttpTTSService(TTSService):
                 "transcript": text,
                 "voice": voice_config,
                 "output_format": self._settings["output_format"],
-                "language": self._settings["language"],
             }
+
+            if self._settings["language"]:
+                payload["language"] = self._settings["language"]
 
             if self._settings["speed"]:
                 payload["speed"] = self._settings["speed"]
@@ -788,7 +823,10 @@ class CartesiaHttpTTSService(TTSService):
                     exclude_none=True
                 )
 
-            yield TTSStartedFrame()
+            if self._settings["pronunciation_dict_id"]:
+                payload["pronunciation_dict_id"] = self._settings["pronunciation_dict_id"]
+
+            yield TTSStartedFrame(context_id=context_id)
 
             session = await self._client._get_session()
 
@@ -814,6 +852,7 @@ class CartesiaHttpTTSService(TTSService):
                 audio=audio_data,
                 sample_rate=self.sample_rate,
                 num_channels=1,
+                context_id=context_id,
             )
 
             yield frame
@@ -822,4 +861,4 @@ class CartesiaHttpTTSService(TTSService):
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
         finally:
             await self.stop_ttfb_metrics()
-            yield TTSStoppedFrame()
+            yield TTSStoppedFrame(context_id=context_id)

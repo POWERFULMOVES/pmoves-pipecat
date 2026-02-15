@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -29,7 +29,6 @@ from pipecat.adapters.services.anthropic_adapter import (
     AnthropicLLMInvocationParams,
 )
 from pipecat.frames.frames import (
-    ErrorFrame,
     Frame,
     FunctionCallCancelFrame,
     FunctionCallInProgressFrame,
@@ -77,11 +76,17 @@ class AnthropicContextAggregatorPair:
     Encapsulates both user and assistant context aggregators
     to manage conversation flow and message formatting.
 
+    .. deprecated:: 0.0.99
+        `AnthropicContextAggregatorPair` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
+
     Parameters:
         _user: The user context aggregator.
         _assistant: The assistant context aggregator.
     """
 
+    # Aggregators handle deprecation warnings
     _user: "AnthropicUserContextAggregator"
     _assistant: "AnthropicAssistantContextAggregator"
 
@@ -256,11 +261,15 @@ class AnthropicLLMService(LLMService):
             response = await api_call(**params)
             return response
 
-    async def run_inference(self, context: LLMContext | OpenAILLMContext) -> Optional[str]:
+    async def run_inference(
+        self, context: LLMContext | OpenAILLMContext, max_tokens: Optional[int] = None
+    ) -> Optional[str]:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
         Args:
             context: The LLM context containing conversation history.
+            max_tokens: Optional maximum number of tokens to generate. If provided,
+                overrides the service's default max_tokens setting.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
@@ -285,7 +294,7 @@ class AnthropicLLMService(LLMService):
         # Build params using the same method as streaming completions
         params = {
             "model": self.model_name,
-            "max_tokens": self._settings["max_tokens"],
+            "max_tokens": max_tokens if max_tokens is not None else self._settings["max_tokens"],
             "stream": False,
             "temperature": self._settings["temperature"],
             "top_k": self._settings["top_k"],
@@ -325,13 +334,21 @@ class AnthropicLLMService(LLMService):
         Returns:
             A pair of context aggregators, one for the user and one for the assistant,
             encapsulated in an AnthropicContextAggregatorPair.
+
+        .. deprecated:: 0.0.99
+            `create_context_aggregator()` is deprecated and will be removed in a future version.
+            Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+            See `OpenAILLMContext` docstring for migration guide.
         """
         context.set_llm_adapter(self.get_llm_adapter())
 
         if isinstance(context, OpenAILLMContext):
             context = AnthropicLLMContext.from_openai_context(context)
+
+        # Aggregators handle deprecation warnings
         user = AnthropicUserContextAggregator(context, params=user_params)
         assistant = AnthropicAssistantContextAggregator(context, params=assistant_params)
+
         return AnthropicContextAggregatorPair(_user=user, _assistant=assistant)
 
     def _get_llm_invocation_params(
@@ -426,7 +443,7 @@ class AnthropicLLMService(LLMService):
 
                 if event.type == "content_block_delta":
                     if hasattr(event.delta, "text"):
-                        await self.push_frame(LLMTextFrame(event.delta.text))
+                        await self._push_llm_text(event.delta.text)
                         completion_tokens_estimate += self._estimate_tokens(event.delta.text)
                     elif hasattr(event.delta, "partial_json") and tool_use_block:
                         json_accumulator += event.delta.partial_json
@@ -602,6 +619,11 @@ class AnthropicLLMContext(OpenAILLMContext):
     Extends OpenAILLMContext to handle Anthropic-specific features like
     system messages, prompt caching, and message format conversions.
     Manages conversation state and message history formatting.
+
+    .. deprecated:: 0.0.99
+        `AnthropicLLMContext` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
 
     def __init__(
@@ -620,6 +642,7 @@ class AnthropicLLMContext(OpenAILLMContext):
             tool_choice: Tool selection preference.
             system: System message content.
         """
+        # Super handles deprecation warning
         super().__init__(messages=messages, tools=tools, tool_choice=tool_choice)
         self.__setup_local()
         self.system = system
@@ -1041,8 +1064,14 @@ class AnthropicUserContextAggregator(LLMUserContextAggregator):
 
     Handles aggregation of user messages for Anthropic LLM services.
     Inherits all functionality from the base LLMUserContextAggregator.
+
+    .. deprecated:: 0.0.99
+        `AnthropicUserContextAggregator` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
 
+    # Super handles deprecation warning
     pass
 
 
@@ -1061,7 +1090,14 @@ class AnthropicAssistantContextAggregator(LLMAssistantContextAggregator):
 
     Handles function call lifecycle management including in-progress tracking,
     result handling, and cancellation for Anthropic's tool use format.
+
+    .. deprecated:: 0.0.99
+        `AnthropicAssistantContextAggregator` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
+
+    # Super handles deprecation warning
 
     async def handle_function_call_in_progress(self, frame: FunctionCallInProgressFrame):
         """Handle a function call that is starting.

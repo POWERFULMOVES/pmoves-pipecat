@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -40,8 +40,6 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
     LLMUpdateSettingsFrame,
-    OutputImageRawFrame,
-    UserImageRawFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -93,7 +91,14 @@ class GoogleUserContextAggregator(OpenAIUserContextAggregator):
 
     Extends OpenAI user context aggregator to handle Google AI's specific
     Content and Part message format for user messages.
+
+    .. deprecated:: 0.0.99
+        `OpenAIUserContextAggregator` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
+
+    # Super handles deprecation warning
 
     async def handle_aggregation(self, aggregation: str):
         """Add the aggregated user text to the context as a Google Content message.
@@ -109,7 +114,14 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
 
     Extends OpenAI assistant context aggregator to handle Google AI's specific
     Content and Part message format for assistant responses and function calls.
+
+    .. deprecated:: 0.0.99
+        `GoogleAssistantContextAggregator` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
+
+    # Super handles deprecation warning
 
     async def handle_aggregation(self, aggregation: str):
         """Handle aggregated assistant text response.
@@ -186,32 +198,22 @@ class GoogleAssistantContextAggregator(OpenAIAssistantContextAggregator):
                     if part.function_response and part.function_response.id == tool_call_id:
                         part.function_response.response = {"value": json.dumps(result)}
 
-    async def handle_user_image_frame(self, frame: UserImageRawFrame):
-        """Handle user image frame.
-
-        Args:
-            frame: Frame containing user image data and request context.
-        """
-        await self._update_function_call_result(
-            frame.request.function_name, frame.request.tool_call_id, "COMPLETED"
-        )
-        self._context.add_image_frame_message(
-            format=frame.format,
-            size=frame.size,
-            image=frame.image,
-            text=frame.request.context,
-        )
-
 
 @dataclass
 class GoogleContextAggregatorPair:
     """Pair of Google context aggregators for user and assistant messages.
+
+    .. deprecated:: 0.0.99
+        `GoogleContextAggregatorPair` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
 
     Parameters:
         _user: User context aggregator for handling user messages.
         _assistant: Assistant context aggregator for handling assistant responses.
     """
 
+    # Aggregators handle deprecation warnings
     _user: GoogleUserContextAggregator
     _assistant: GoogleAssistantContextAggregator
 
@@ -237,6 +239,11 @@ class GoogleLLMContext(OpenAILLMContext):
 
     This class handles conversion between OpenAI-style messages and Google AI's
     Content/Part format, including system messages, function calls, and media.
+
+    .. deprecated:: 0.0.99
+        `GoogleLLMContext` is deprecated and will be removed in a future version.
+        Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+        See `OpenAILLMContext` docstring for migration guide.
     """
 
     def __init__(
@@ -252,6 +259,7 @@ class GoogleLLMContext(OpenAILLMContext):
             tools: Available tools/functions for the model.
             tool_choice: Tool choice configuration.
         """
+        # Super handles deprecation warning
         super().__init__(messages=messages, tools=tools, tool_choice=tool_choice)
         self.system_message = None
 
@@ -682,16 +690,18 @@ class GoogleLLMService(LLMService):
         Gemini 2.5 and 3 series models have this thinking process.
 
         Parameters:
-            thinking_level: Thinking level for Gemini 3 Pro. Can be "low" or "high".
-                If not provided, Gemini 3 Pro defaults to "high".
-                Note: Gemini 2.5 series should use thinking_budget instead.
+            thinking_level: Thinking level for Gemini 3 models.
+                For Gemini 3 Pro, this can be "low" or "high".
+                For Gemini 3 Flash, this can be "minimal", "low", "medium", or "high".
+                If not provided, Gemini 3 models default to "high".
+                Note: Gemini 2.5 series must use thinking_budget instead.
             thinking_budget: Token budget for thinking, for Gemini 2.5 series.
                 -1 for dynamic thinking (model decides), 0 to disable thinking,
                 or a specific token count (e.g., 128-32768 for 2.5 Pro).
                 If not provided, most models today default to dynamic thinking.
                 See https://ai.google.dev/gemini-api/docs/thinking#set-budget
                 for default values and allowed ranges.
-                Note: Gemini 3 Pro should use thinking_level instead.
+                Note: Gemini 3 models must use thinking_level instead.
             include_thoughts: Whether to include thought summaries in the response.
                 Today's models default to not including thoughts (False).
         """
@@ -700,7 +710,9 @@ class GoogleLLMService(LLMService):
 
         # Why `| str` here? To not break compatibility in case Google adds more
         # levels in the future.
-        thinking_level: Optional[Literal["low", "high"] | str] = Field(default=None)
+        thinking_level: Optional[Literal["low", "high", "medium", "minimal"] | str] = Field(
+            default=None
+        )
 
         include_thoughts: Optional[bool] = Field(default=None)
 
@@ -787,11 +799,15 @@ class GoogleLLMService(LLMService):
         """Create the Gemini client instance. Subclasses can override this."""
         self._client = genai.Client(api_key=self._api_key, http_options=self._http_options)
 
-    async def run_inference(self, context: LLMContext | OpenAILLMContext) -> Optional[str]:
+    async def run_inference(
+        self, context: LLMContext | OpenAILLMContext, max_tokens: Optional[int] = None
+    ) -> Optional[str]:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
         Args:
             context: The LLM context containing conversation history.
+            max_tokens: Optional maximum number of tokens to generate. If provided,
+                overrides the service's default max_tokens setting.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
@@ -815,6 +831,10 @@ class GoogleLLMService(LLMService):
         generation_params = self._build_generation_params(
             system_instruction=system, tools=tools if tools else None
         )
+
+        # Override max_output_tokens if provided
+        if max_tokens is not None:
+            generation_params["max_output_tokens"] = max_tokens
 
         generation_config = GenerateContentConfig(**generation_params)
 
@@ -1011,7 +1031,7 @@ class GoogleLLMService(LLMService):
                                     await self.push_frame(LLMThoughtEndFrame())
                                 else:
                                     accumulated_text += part.text
-                                    await self.push_frame(LLMTextFrame(part.text))
+                                    await self._push_llm_text(part.text)
                             elif part.function_call:
                                 function_call = part.function_call
                                 function_call_id = function_call.id or str(uuid.uuid4())
@@ -1225,11 +1245,18 @@ class GoogleLLMService(LLMService):
             the user and one for the assistant, encapsulated in an
             GoogleContextAggregatorPair.
 
+        .. deprecated:: 0.0.99
+            `create_context_aggregator()` is deprecated and will be removed in a future version.
+            Use the universal `LLMContext` and `LLMContextAggregatorPair` instead.
+            See `OpenAILLMContext` docstring for migration guide.
         """
         context.set_llm_adapter(self.get_llm_adapter())
 
         if isinstance(context, OpenAILLMContext):
             context = GoogleLLMContext.upgrade_to_google(context)
+
+        # Aggregators handle deprecation warnings
         user = GoogleUserContextAggregator(context, params=user_params)
         assistant = GoogleAssistantContextAggregator(context, params=assistant_params)
+
         return GoogleContextAggregatorPair(_user=user, _assistant=assistant)

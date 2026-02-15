@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -114,6 +114,10 @@ class RNNoiseFilter(BaseAudioFilter):
         in_audio = audio
         if self._sample_rate != 48000 and self._resampler_in:
             in_audio = await self._resampler_in.resample(audio, self._sample_rate, 48000)
+
+        # If audio is empty, return empty bytes (no point in noise cancellation)
+        if len(in_audio) == 0:
+            return b""
 
         # Convert bytes to numpy array (int16)
         audio_samples = np.frombuffer(in_audio, dtype=np.int16)
