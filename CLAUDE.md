@@ -153,3 +153,11 @@ When adding a new service:
 
 Test utilities live in `src/pipecat/tests/utils.py`. Use `run_test()` to send frames through a pipeline and assert expected output frames in each direction. Use `SleepFrame(sleep=N)` to add delays between frames.
 
+<!-- PMOVES.AI-CONTEXT-TAGS -->
+## PMOVES.AI Skill Hints
+
+**Primary Skills:** `/pipecat:connect`, `/pipecat:status`, `/tts:synthesize`, `/deploy:up`, `/health:quick`
+**Context Files:** `flute-gateway.md`, `voice-personas.md`, `nats-subjects.md`
+**Domain Tags:** `voice`, `media`
+**Context Tier:** 2 (On-Demand (Major Subsystem))
+<!-- /PMOVES.AI-CONTEXT-TAGS -->
