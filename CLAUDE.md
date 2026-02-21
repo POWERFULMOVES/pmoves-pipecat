@@ -153,6 +153,14 @@ When adding a new service:
 
 Test utilities live in `src/pipecat/tests/utils.py`. Use `run_test()` to send frames through a pipeline and assert expected output frames in each direction. Use `SleepFrame(sleep=N)` to add delays between frames.
 
+## Security Posture
+
+- **Library** (not standalone service) — auth is delegated to the application layer
+- **P2 OPEN:** No MCP tool allowlisting (all registered tools are exposed to connected clients)
+- **P2 OPEN:** No Prometheus metrics export (library scope, not service scope)
+- **GREEN:** Frame-based architecture isolates processing stages
+- **GREEN:** Transport layer handles auth (Daily/LiveKit tokens, WebSocket auth)
+
 <!-- PMOVES.AI-CONTEXT-TAGS -->
 ## PMOVES.AI Skill Hints
 
