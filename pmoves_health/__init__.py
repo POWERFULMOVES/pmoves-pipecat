@@ -47,6 +47,7 @@ import asyncio
 try:
     from fastapi import APIRouter, HTTPException
     from fastapi.responses import JSONResponse
+
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
@@ -59,6 +60,7 @@ HEALTH_CHECK_TIMEOUT = 5.0
 
 class HealthStatus:
     """Health status constants."""
+
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"
@@ -105,6 +107,7 @@ class HTTPCheck(DependencyCheck):
     async def check(self) -> bool:
         try:
             import httpx
+
             async with httpx.AsyncClient(timeout=2.0) as client:
                 response = await client.get(self.url)
                 return response.status_code == 200
@@ -123,6 +126,7 @@ class NATSCheck(DependencyCheck):
         nc = None
         try:
             from nats.aio.client import Client as NATS
+
             nc = await NATS.connect(self.nats_url, connect_timeout=2)
             return True
         except Exception:
@@ -231,6 +235,7 @@ def health_check(checks: List[DependencyCheck] = None):
         async def my_handler():
             ...
     """
+
     def decorator(func: Callable):
         # Register checks once when decorator is applied, not on each call
         if checks:
@@ -240,7 +245,9 @@ def health_check(checks: List[DependencyCheck] = None):
         @wraps(func)
         async def wrapper(*args, **kwargs):
             return await func(*args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -293,10 +300,12 @@ if FASTAPI_AVAILABLE:
     def create_health_app(service_name: str = None) -> "FastAPI":
         """Create a minimal FastAPI app with health check."""
         from fastapi import FastAPI
+
         app = FastAPI(title=service_name or "PMOVES Service")
         app.include_router(health_check_router)
         return app
 else:
+
     def create_health_app(service_name: str = None):
         """Raise error if FastAPI not available."""
         raise ImportError("FastAPI is required to create health app")
@@ -304,6 +313,7 @@ else:
 
 # Example usage
 if __name__ == "__main__":
+
     async def example_usage():
         """Example of how to use the health checker."""
 
@@ -317,6 +327,7 @@ if __name__ == "__main__":
         # Add custom check
         async def check_memory():
             import psutil
+
             return psutil.virtual_memory().percent < 90
 
         checker.add_custom_check("memory_ok", check_memory)

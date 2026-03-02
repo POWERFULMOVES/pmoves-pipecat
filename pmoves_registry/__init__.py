@@ -45,6 +45,7 @@ except ImportError:
 
     class ServiceTier(str, Enum):
         """PMOVES service tiers (6-tier architecture)."""
+
         DATA = "data"
         API = "api"
         LLM = "llm"
