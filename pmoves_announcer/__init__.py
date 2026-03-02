@@ -54,6 +54,7 @@ except ImportError:
 
     class ServiceTier(str, Enum):
         """PMOVES service tiers (6-tier architecture)."""
+
         DATA = "data"
         API = "api"
         LLM = "llm"
@@ -155,7 +156,7 @@ class ServiceAnnouncer:
         self.tier = tier
 
         self.health_check = health_check or f"{url.rstrip('/')}/healthz"
-        self.nats_url = nats_url or os.getenv("NATS_URL", "nats://nats:4222")
+        self.nats_url = nats_url or os.getenv("NATS_URL", "nats://nats:pmoves@nats:4222")
         self.metadata = metadata or {}
 
     def create_announcement(self) -> ServiceAnnouncement:
@@ -196,9 +197,7 @@ class ServiceAnnouncer:
             print(f"Failed to announce service: {e}")
             return False
 
-    async def announce_with_retry(
-        self, max_retries: int = 3, delay: float = 1.0
-    ) -> bool:
+    async def announce_with_retry(self, max_retries: int = 3, delay: float = 1.0) -> bool:
         """
         Announce service with retry logic.
 
@@ -318,6 +317,7 @@ class BackgroundAnnouncer:
 
 # Example usage and testing
 if __name__ == "__main__":
+
     async def main():
         """Example usage of service announcer."""
 

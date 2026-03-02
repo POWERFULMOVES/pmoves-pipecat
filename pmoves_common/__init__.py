@@ -31,6 +31,7 @@ class ServiceTier(str, Enum):
     Security Note: LLM tier is the SINGLE POINT for external API keys.
     All other services call TensorZero internally and never touch provider keys.
     """
+
     DATA = "data"
     API = "api"
     LLM = "llm"
@@ -49,6 +50,7 @@ class ServiceTier(str, Enum):
 
 class HealthStatus(str, Enum):
     """Health status constants for service health checks."""
+
     HEALTHY = "healthy"
     DEGRADED = "degraded"
     UNHEALTHY = "unhealthy"

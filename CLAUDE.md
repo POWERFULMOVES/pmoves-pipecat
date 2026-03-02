@@ -161,6 +161,17 @@ Test utilities live in `src/pipecat/tests/utils.py`. Use `run_test()` to send fr
 - **GREEN:** Frame-based architecture isolates processing stages
 - **GREEN:** Transport layer handles auth (Daily/LiveKit tokens, WebSocket auth)
 
+## CHIT & Geometry Bus Integration
+
+**Status: No CHIT integration (by design)**
+
+Pipecat is an upstream open-source library for real-time voice/multimodal AI. CHIT integration is not applicable:
+- Library-only scope — no standalone service, no NATS connection
+- Voice geometry (prosodic synthesis) is handled by Flute-Gateway, not Pipecat directly
+- Pipecat provides the pipeline framework; CHIT awareness lives in the application layer (Flute-Gateway)
+
+**Related:** Flute-Gateway (`pmoves/services/flute-gateway/`) uses Pipecat internally and does publish to `tokenism.geometry.event.v1`.
+
 <!-- PMOVES.AI-CONTEXT-TAGS -->
 ## PMOVES.AI Skill Hints
 

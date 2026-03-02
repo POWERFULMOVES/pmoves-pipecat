@@ -205,6 +205,8 @@ ignore = [
 "tests/**/*.py" = ["D"]
 "scripts/**/*.py" = ["D"]
 "docs/**/*.py" = ["D"]
+# PMOVES helper packages are integration shims; skip strict doc/import style.
+"pmoves_*/**/*.py" = ["D", "I"]
 # Skip D104 (missing docstring in public package) for __init__.py files
 "**/__init__.py" = ["D104"]
 # Skip specific rules for generated protobuf files
