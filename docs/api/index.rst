@@ -22,6 +22,7 @@ Quick Links
    Audio <api/pipecat.audio>
    Clocks <api/pipecat.clocks>
    Extensions <api/pipecat.extensions>
+   Flows <api/pipecat.flows>
    Frames <api/pipecat.frames>
    Metrics <api/pipecat.metrics>
    Observers <api/pipecat.observers>
@@ -32,4 +33,5 @@ Quick Links
    Services <api/pipecat.services>
    Transcriptions <api/pipecat.transcriptions>
    Transports <api/pipecat.transports>
+   Turns <api/pipecat.turns>
    Utils <api/pipecat.utils>

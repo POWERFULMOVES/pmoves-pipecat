@@ -6,8 +6,6 @@
 
 """User mute strategy that mutes the user while a function call is executing."""
 
-from typing import Set
-
 from pipecat.frames.frames import (
     Frame,
     FunctionCallCancelFrame,
@@ -30,11 +28,7 @@ class FunctionCallUserMuteStrategy(BaseUserMuteStrategy):
     def __init__(self):
         """Initialize the function call user mute strategy."""
         super().__init__()
-        self._function_call_in_progress: Set[str] = set()
-
-    async def reset(self):
-        """Reset the strategy to its initial state."""
-        self._function_call_in_progress = set()
+        self._function_call_in_progress: set[str] = set()
 
     async def process_frame(self, frame: Frame) -> bool:
         """Process an incoming frame.
@@ -50,7 +44,11 @@ class FunctionCallUserMuteStrategy(BaseUserMuteStrategy):
         if isinstance(frame, FunctionCallsStartedFrame):
             await self._handle_function_calls_started(frame)
         elif isinstance(frame, (FunctionCallCancelFrame, FunctionCallResultFrame)):
-            self._function_call_in_progress.remove(frame.tool_call_id)
+            # Untracked ids reach here: cancel_async_tool_call is excluded from
+            # FunctionCallsStartedFrame yet still emits a result, async tools
+            # emit a result frame per intermediate update, and a bus bridge can
+            # re-deliver a result another worker already handled.
+            self._function_call_in_progress.discard(frame.tool_call_id)
 
         return bool(self._function_call_in_progress)
 

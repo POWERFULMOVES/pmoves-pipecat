@@ -8,10 +8,9 @@
 
 import base64
 import json
-from typing import Optional
+from typing import cast
 
 from loguru import logger
-from pydantic import BaseModel
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.utils import create_stream_resampler, pcm_to_ulaw, ulaw_to_pcm
@@ -28,6 +27,31 @@ from pipecat.frames.frames import (
     StartFrame,
 )
 from pipecat.serializers.base_serializer import FrameSerializer
+
+
+def _build_call_resource_url(
+    account_sid: str,
+    call_sid: str,
+    *,
+    base_url: str | None = None,
+    region: str | None = None,
+    edge: str | None = None,
+) -> str:
+    """Build the REST URL for a Call resource (used by auto hang-up).
+
+    When ``base_url`` is provided it is used verbatim as the API root (scheme +
+    host, e.g. ``https://api.twilio.com``), which lets the serializer target a
+    Twilio-API-compatible backend or a self-hosted server. Otherwise the host is
+    derived from Twilio's ``region``/``edge`` FQDN format, preserving the prior
+    default behavior.
+    """
+    if base_url:
+        root = base_url.rstrip("/")
+    else:
+        region_prefix = f"{region}." if region else ""
+        edge_prefix = f"{edge}." if edge else ""
+        root = f"https://api.{edge_prefix}{region_prefix}twilio.com"
+    return f"{root}/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json"
 
 
 class TwilioFrameSerializer(FrameSerializer):
@@ -53,18 +77,19 @@ class TwilioFrameSerializer(FrameSerializer):
         """
 
         twilio_sample_rate: int = 8000
-        sample_rate: Optional[int] = None
+        sample_rate: int | None = None
         auto_hang_up: bool = True
 
     def __init__(
         self,
         stream_sid: str,
-        call_sid: Optional[str] = None,
-        account_sid: Optional[str] = None,
-        auth_token: Optional[str] = None,
-        region: Optional[str] = None,
-        edge: Optional[str] = None,
-        params: Optional[InputParams] = None,
+        call_sid: str | None = None,
+        account_sid: str | None = None,
+        auth_token: str | None = None,
+        region: str | None = None,
+        edge: str | None = None,
+        base_url: str | None = None,
+        params: InputParams | None = None,
     ):
         """Initialize the TwilioFrameSerializer.
 
@@ -75,9 +100,15 @@ class TwilioFrameSerializer(FrameSerializer):
             auth_token: Twilio auth token (required for auto hang-up).
             region: Twilio region (e.g., "au1", "ie1"). Must be specified with edge.
             edge: Twilio edge location (e.g., "sydney", "dublin"). Must be specified with region.
+            base_url: Optional REST API base URL (scheme + host, e.g.
+                ``https://api.twilio.com``) used for auto hang-up. Defaults to the
+                host derived from region/edge. Set this to target a Twilio-API-
+                compatible backend or a self-hosted server.
             params: Configuration parameters.
         """
-        super().__init__(params or TwilioFrameSerializer.InputParams())
+        params = params or TwilioFrameSerializer.InputParams()
+        super().__init__(params)
+        self._params: TwilioFrameSerializer.InputParams = params
 
         # Validate hangup-related parameters if auto_hang_up is enabled
         if self._params.auto_hang_up:
@@ -95,8 +126,10 @@ class TwilioFrameSerializer(FrameSerializer):
                     f"auto_hang_up is enabled but missing required parameters: {', '.join(missing_credentials)}"
                 )
 
-            # Validate region and edge are both provided if either is specified
-            if (region and not edge) or (edge and not region):
+            # Validate region and edge are both provided if either is specified.
+            # Only applies when deriving Twilio's FQDN host; base_url is used
+            # verbatim and ignores region/edge, so the pairing requirement is moot.
+            if not base_url and ((region and not edge) or (edge and not region)):
                 raise ValueError(
                     "Both edge and region parameters are required if one is set. "
                     f"Twilio's FQDN format requires both: api.{{edge}}.{{region}}.twilio.com. "
@@ -109,12 +142,17 @@ class TwilioFrameSerializer(FrameSerializer):
         self._auth_token = auth_token
         self._region = region
         self._edge = edge
+        self._base_url = base_url
 
         self._twilio_sample_rate = self._params.twilio_sample_rate
         self._sample_rate = 0  # Pipeline input rate
 
-        self._input_resampler = create_stream_resampler()
-        self._output_resampler = create_stream_resampler()
+        self._input_resampler = create_stream_resampler(
+            clear_after_secs=self._params.resampler_clear_after_secs
+        )
+        self._output_resampler = create_stream_resampler(
+            clear_after_secs=self._params.resampler_clear_after_secs
+        )
         self._hangup_attempted = False
 
     async def setup(self, frame: StartFrame):
@@ -180,17 +218,20 @@ class TwilioFrameSerializer(FrameSerializer):
         try:
             import aiohttp
 
-            account_sid = self._account_sid
-            auth_token = self._auth_token
-            call_sid = self._call_sid
-            region = self._region
-            edge = self._edge
-
-            region_prefix = f"{region}." if region else ""
-            edge_prefix = f"{edge}." if edge else ""
-
-            # Twilio API endpoint for updating calls
-            endpoint = f"https://api.{edge_prefix}{region_prefix}twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json"
+            # __init__ guarantees these are non-None whenever auto_hang_up is True,
+            # which is the only path that reaches this method.
+            account_sid = cast(str, self._account_sid)
+            auth_token = cast(str, self._auth_token)
+            call_sid = cast(str, self._call_sid)
+            # REST endpoint for updating the call. Derived from base_url when set
+            # (Twilio-API-compatible / self-hosted), else Twilio's region/edge FQDN.
+            endpoint = _build_call_resource_url(
+                account_sid,
+                call_sid,
+                base_url=self._base_url,
+                region=self._region,
+                edge=self._edge,
+            )
 
             # Create basic auth from account_sid and auth_token
             auth = aiohttp.BasicAuth(account_sid, auth_token)
@@ -212,7 +253,7 @@ class TwilioFrameSerializer(FrameSerializer):
                             if error_data.get("code") == 20404:
                                 logger.debug(f"Twilio call {call_sid} was already terminated")
                                 return
-                        except:
+                        except Exception:
                             pass  # Fall through to log the raw error
 
                         # Log other 404 errors

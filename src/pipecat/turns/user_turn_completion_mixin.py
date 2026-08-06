@@ -14,24 +14,53 @@ were interrupted mid-thought.
 
 import asyncio
 from dataclasses import dataclass
-from typing import Literal, Optional
+from enum import Enum
 
 from loguru import logger
 
 from pipecat.frames.frames import (
     Frame,
+    FunctionCallsStartedFrame,
     InterruptionFrame,
     LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    LLMMarkerFrame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
     LLMTextFrame,
+    UserStartedSpeakingFrame,
+    UserTurnInferenceCompletedFrame,
+    VADUserStartedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 # Turn completion markers
 USER_TURN_COMPLETE_MARKER = "✓"
 USER_TURN_INCOMPLETE_SHORT_MARKER = "○"  # Short wait - user likely continues soon
 USER_TURN_INCOMPLETE_LONG_MARKER = "◐"  # Long wait - user needs more time
+
+
+class TurnMarker(Enum):
+    """Completion verdict detected in the current LLM response.
+
+    - ``COMPLETE``:   ✓ detected, response flows through as speech.
+    - ``INCOMPLETE``: ○/◐ detected, response suppressed, timeout armed.
+    """
+
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+
+
+class IncompleteType(Enum):
+    """How long to wait before re-prompting after an incomplete turn.
+
+    - ``SHORT``: ○ detected, the user was cut off and likely continues soon.
+    - ``LONG``:  ◐ detected, the user needs more time to think.
+    """
+
+    SHORT = "short"
+    LONG = "long"
+
 
 # Default prompts for incomplete timeouts
 DEFAULT_INCOMPLETE_SHORT_PROMPT = """The user paused briefly. Generate a brief, natural prompt to encourage them to continue.
@@ -147,7 +176,7 @@ Remember: Focus on conversational completeness and how long the user might need.
 class UserTurnCompletionConfig:
     """Configuration for turn completion behavior.
 
-    Attributes:
+    Parameters:
         instructions: Custom instructions for turn completion. If not provided,
             uses default USER_TURN_COMPLETION_INSTRUCTIONS.
         incomplete_short_timeout: Seconds to wait after short incomplete (○) before prompting.
@@ -156,11 +185,11 @@ class UserTurnCompletionConfig:
         incomplete_long_prompt: Custom prompt when long timeout expires.
     """
 
-    instructions: Optional[str] = None
+    instructions: str | None = None
     incomplete_short_timeout: float = 5.0
     incomplete_long_timeout: float = 10.0
-    incomplete_short_prompt: Optional[str] = None
-    incomplete_long_prompt: Optional[str] = None
+    incomplete_short_prompt: str | None = None
+    incomplete_long_prompt: str | None = None
 
     @property
     def completion_instructions(self) -> str:
@@ -178,22 +207,20 @@ class UserTurnCompletionConfig:
         return self.incomplete_long_prompt or DEFAULT_INCOMPLETE_LONG_PROMPT
 
 
-class UserTurnCompletionLLMServiceMixin:
+class UserTurnCompletionLLMServiceMixin(FrameProcessor):
     """Mixin that adds turn completion detection to LLM services.
 
     This mixin provides methods to push LLM text with turn completion detection.
     It processes turn completion markers to enable smarter conversation flow:
 
     - ✓ (COMPLETE): Push response normally
-    - ○ (INCOMPLETE SHORT): Suppress response, wait ~5s, then prompt
-    - ◐ (INCOMPLETE LONG): Suppress response, wait ~15s, then prompt
+    - ○ (INCOMPLETE SHORT): Suppress response, wait 5s, then prompt
+    - ◐ (INCOMPLETE LONG): Suppress response, wait 10s, then prompt
 
     When incomplete timeouts expire, the mixin automatically prompts the LLM
     with a contextual follow-up message to re-engage the user.
 
-    Usage:
-        The LLM service controls when to use turn completion by calling
-        _push_turn_text instead of push_frame:
+    Usage example::
 
         # With turn completion:
         if self._filter_incomplete_user_turns:
@@ -201,7 +228,10 @@ class UserTurnCompletionLLMServiceMixin:
         else:
             await self.push_frame(LLMTextFrame(chunk.text))
 
-    The mixin requires that the base class has a `push_frame` method compatible
+    The LLM service controls when to use turn completion by calling
+    ``_push_turn_text`` instead of ``push_frame``.
+
+    The mixin requires that the base class has a ``push_frame`` method compatible
     with FrameProcessor's signature.
     """
 
@@ -214,16 +244,32 @@ class UserTurnCompletionLLMServiceMixin:
         """
         super().__init__(*args, **kwargs)
         self._turn_text_buffer = ""
-        # Safety mechanism: True when incomplete is detected. While the prompt
-        # instructs the LLM to output ONLY the marker for incomplete turns, this flag
-        # ensures graceful degradation if the LLM disobeys and outputs additional text.
-        self._turn_suppressed = False
-        self._turn_complete_found = False  # True when ✓ (COMPLETE) is detected
+        # Completion verdict for the current LLM response, set when a marker is
+        # detected in the text stream. ``None`` means no marker yet, so keep
+        # buffering text until one appears. ``INCOMPLETE`` also doubles as a
+        # safety latch: the prompt tells the LLM to emit only the marker, but if
+        # it disobeys and streams more text we keep suppressing it.
+        self._turn_marker: TurnMarker | None = None
+        # True once ``UserTurnInferenceCompletedFrame`` has been broadcast
+        # for this turn. Prevents double-broadcast when ✓ and a tool call
+        # both occur in the same turn.
+        self._turn_completion_broadcasted = False
+        # True once a ✓ has been voiced since the user last started speaking.
+        # Reset on UserStartedSpeakingFrame / InterruptionFrame (new turn) and
+        # on VADUserStartedSpeakingFrame (resumed mid-turn), unlike the
+        # per-response flags above (reset every LLMFullResponseEnd). The
+        # acoustic detector can trigger several inferences within one user
+        # turn, each independently producing a ✓; this latch voices at most
+        # one per speaking segment, so the bot does not immediately repeat
+        # itself. It is not a per-turn guarantee: resetting on a mid-turn
+        # resume is required so a completion stale-dropped by the controller
+        # (see UserTurnController._trigger_user_turn_stop) doesn't
+        # permanently silence the turn.
+        self._user_turn_completion_voiced = False
 
         # Timeout handling
         self._user_turn_completion_config = UserTurnCompletionConfig()
-        self._incomplete_timeout_task: Optional[asyncio.Task] = None
-        self._incomplete_type: Optional[Literal["short", "long"]] = None
+        self._incomplete_timeout_task: asyncio.Task | None = None
 
     def set_user_turn_completion_config(self, config: UserTurnCompletionConfig):
         """Set the turn completion configuration.
@@ -233,26 +279,45 @@ class UserTurnCompletionLLMServiceMixin:
         """
         self._user_turn_completion_config = config
 
-    async def _start_incomplete_timeout(self, incomplete_type: Literal["short", "long"]):
+    async def _broadcast_turn_completion(self):
+        """Broadcast ``UserTurnInferenceCompletedFrame`` at most once per turn.
+
+        Called from the two places we know the LLM has committed to a
+        response for the current user turn:
+
+        - the ``✓`` marker is detected in the text stream
+        - a ``FunctionCallsStartedFrame`` is emitted — the LLM committed
+          to a tool call before producing (or instead of) a marker.
+
+        Broadcasting on the tool-call path matters for races: the
+        downstream ``UserStoppedSpeakingFrame`` needs to propagate
+        before the function actually executes and a
+        ``FunctionCallResultFrame`` flows back to the assistant
+        aggregator.
+        """
+        if self._turn_completion_broadcasted:
+            return
+        self._turn_completion_broadcasted = True
+        await self.broadcast_frame(UserTurnInferenceCompletedFrame)
+
+    async def _start_incomplete_timeout(self, incomplete_type: IncompleteType):
         """Start a timeout task for incomplete turn handling.
 
         Args:
-            incomplete_type: Either "short" or "long" to determine timeout duration.
+            incomplete_type: Whether to use the short or long timeout duration.
         """
         # Cancel any existing timeout
         await self._cancel_incomplete_timeout()
 
-        self._incomplete_type = incomplete_type
-
-        if incomplete_type == "short":
+        if incomplete_type == IncompleteType.SHORT:
             timeout = self._user_turn_completion_config.incomplete_short_timeout
         else:
             timeout = self._user_turn_completion_config.incomplete_long_timeout
 
-        logger.debug(f"Starting {incomplete_type} incomplete timeout ({timeout}s)")
+        logger.debug(f"Starting {incomplete_type.value} incomplete timeout ({timeout}s)")
         self._incomplete_timeout_task = self.create_task(
             self._incomplete_timeout_handler(incomplete_type, timeout),
-            f"_incomplete_timeout_{incomplete_type}",
+            f"_incomplete_timeout_{incomplete_type.value}",
         )
 
     async def _cancel_incomplete_timeout(self):
@@ -261,35 +326,31 @@ class UserTurnCompletionLLMServiceMixin:
             logger.debug("Cancelling incomplete timeout")
             await self.cancel_task(self._incomplete_timeout_task)
         self._incomplete_timeout_task = None
-        self._incomplete_type = None
 
-    async def _incomplete_timeout_handler(
-        self, incomplete_type: Literal["short", "long"], timeout: float
-    ):
+    async def _incomplete_timeout_handler(self, incomplete_type: IncompleteType, timeout: float):
         """Handle incomplete timeout expiration.
 
         Args:
-            incomplete_type: Either "short" or "long".
+            incomplete_type: Whether this is the short or long timeout.
             timeout: The timeout duration in seconds.
         """
         try:
             await asyncio.sleep(timeout)
 
             # Timeout expired - reset state before prompting LLM
-            logger.info(f"Incomplete {incomplete_type} timeout expired, prompting LLM")
+            logger.debug(f"Incomplete {incomplete_type.value} timeout expired, prompting LLM")
             await self._turn_reset()
             self._incomplete_timeout_task = None
-            self._incomplete_type = None
 
             # Get the appropriate prompt
-            if incomplete_type == "short":
+            if incomplete_type == IncompleteType.SHORT:
                 prompt = self._user_turn_completion_config.short_prompt
             else:
                 prompt = self._user_turn_completion_config.long_prompt
 
             # Push through pipeline to trigger LLM response
             await self.push_frame(
-                LLMMessagesAppendFrame(messages=[{"role": "system", "content": prompt}])
+                LLMMessagesAppendFrame(messages=[{"role": "developer", "content": prompt}])
             )
             await self.push_frame(LLMRunFrame())
 
@@ -303,12 +364,13 @@ class UserTurnCompletionLLMServiceMixin:
         Call this at the end of each LLM response to clear buffered text and reset state.
         If no marker was found, pushes the buffered text to avoid losing content.
 
-        Note: This does NOT cancel pending incomplete timeouts. Timeouts are only
-        cancelled on InterruptionFrame (when user speaks).
+        Note: This does NOT cancel pending incomplete timeouts. Timeouts are
+        cancelled on InterruptionFrame (when the user speaks) and on
+        LLMFullResponseStartFrame (when a new inference begins).
         """
-        # Check if no marker was found in this response
-        marker_found = self._turn_suppressed or self._turn_complete_found
-        if not marker_found and self._turn_text_buffer:
+        # If no marker was found in this response, push the buffered text so
+        # it's not lost.
+        if self._turn_marker is None and self._turn_text_buffer:
             # Graceful degradation: push the buffered text so it's not lost
             logger.warning(
                 f"{self}: filter_incomplete_user_turns is enabled but LLM response did not "
@@ -318,8 +380,8 @@ class UserTurnCompletionLLMServiceMixin:
             await self.push_frame(LLMTextFrame(self._turn_text_buffer))
 
         self._turn_text_buffer = ""
-        self._turn_suppressed = False
-        self._turn_complete_found = False
+        self._turn_marker = None
+        self._turn_completion_broadcasted = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames, handling turn completion state resets.
@@ -332,13 +394,73 @@ class UserTurnCompletionLLMServiceMixin:
         if isinstance(frame, InterruptionFrame):
             await self._cancel_incomplete_timeout()
             await self._turn_reset()
-        # Reset turn state at end of LLM response (but don't cancel timeout -
-        # incomplete timeouts should continue running)
-        elif isinstance(frame, LLMFullResponseEndFrame):
-            await self._turn_reset()
+            self._user_turn_completion_voiced = False
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # A new user turn begins, so allow one fresh spoken completion.
+            self._user_turn_completion_voiced = False
+        elif isinstance(frame, LLMMessagesAppendFrame) and frame.run_llm:
+            # An externally appended message that asks for a run (e.g. a user-idle
+            # check-in) is an explicit request for fresh speech, and it arrives
+            # precisely while the user is silent. Clear the voiced latch so the ✓
+            # guard in ``_push_turn_text`` does not drop its text.
+            self._user_turn_completion_voiced = False
+        elif isinstance(frame, VADUserStartedSpeakingFrame):
+            # The user resumed speaking within the same open turn. A new turn's
+            # InterruptionFrame does not fire for a resume inside an already-open
+            # turn, so two things that normally reset on a fresh turn need
+            # handling here instead:
+            #
+            # 1. An armed ○/◐ re-prompt timeout would otherwise expire and
+            #    nudge (talking over) a user who is speaking again. Cancel it.
+            #    The ○/◐ response already ended and reset the per-response
+            #    state; the next inference re-arms a fresh timer if needed.
+            await self._cancel_incomplete_timeout()
+            # 2. Allow one fresh spoken completion: resetting on a mid-turn
+            #    resume is required so a completion stale-dropped by the
+            #    controller (see UserTurnController._trigger_user_turn_stop)
+            #    doesn't permanently silence the turn.
+            self._user_turn_completion_voiced = False
 
         # Pass frame to parent
         await super().process_frame(frame, direction)
+
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame downstream, resetting turn state at end of each LLM response.
+
+        ``LLMFullResponseEndFrame`` is generated by the LLM service itself (pushed,
+        not received), so it must be handled here rather than in ``process_frame``.
+
+        Args:
+            frame: The frame to push downstream.
+            direction: The direction of frame flow. Defaults to downstream.
+        """
+        if isinstance(frame, FunctionCallsStartedFrame):
+            # Broadcast turn completion now, before the function dispatches
+            # — gives ``UserStoppedSpeakingFrame`` maximum time to propagate
+            # so the assistant aggregator's ``_user_speaking`` is False by
+            # the time a ``FunctionCallResultFrame`` arrives.
+            await self._broadcast_turn_completion()
+            # A function call means a fresh post-tool inference is coming, and
+            # that response is expected to speak. Clear the voiced latch so the
+            # ✓ guard in ``_push_turn_text`` does not drop its text. The
+            # response that voiced the ✓ keeps streaming: its ``_turn_marker``
+            # is COMPLETE, so its text takes the COMPLETE branch, not the
+            # latch guard.
+            self._user_turn_completion_voiced = False
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            # A new LLM response is starting. If an incomplete timeout is still
+            # pending from a prior ○/◐, the LLM is already re-engaging: either
+            # the user's turn completed and this response carries the ✓, or the
+            # timeout already fired its own re-prompt. Either way the pending
+            # re-prompt is now redundant, so cancel it to avoid running a
+            # second inference. This is the single point that resolves the race
+            # between the timeout firing and a ✓ arriving: whichever inference
+            # starts first cancels the timeout before its text is parsed.
+            await self._cancel_incomplete_timeout()
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            await self._turn_reset()
+
+        await super().push_frame(frame, direction)
 
     async def _push_turn_text(self, text: str):
         """Push LLM text with turn completion detection.
@@ -354,14 +476,22 @@ class UserTurnCompletionLLMServiceMixin:
         Args:
             text: The text content from the LLM to push.
         """
+        # One spoken completion per user turn: once a ✓ has been voiced this
+        # user turn, drop text from any later inference (the acoustic detector
+        # can trigger several within one turn). ``_turn_marker is None`` scopes
+        # this to *fresh* responses — the response that produced the voiced ✓
+        # keeps streaming, since by then its marker is COMPLETE.
+        if self._user_turn_completion_voiced and self._turn_marker is None:
+            return
+
         # If we've already detected incomplete, suppress all remaining text.
         # This is a safety mechanism in case the LLM disobeys the prompt and outputs
         # additional text after the marker (e.g., "○ Please continue...").
-        if self._turn_suppressed:
+        if self._turn_marker == TurnMarker.INCOMPLETE:
             return
 
         # If ✓ (COMPLETE) was already found, push text immediately without buffering
-        if self._turn_complete_found:
+        if self._turn_marker == TurnMarker.COMPLETE:
             await self.push_frame(LLMTextFrame(text))
             return
 
@@ -371,28 +501,32 @@ class UserTurnCompletionLLMServiceMixin:
         # Check for incomplete markers (○ short, ◐ long)
         # These indicate the user was cut off or needs time - we suppress the bot's
         # response and start a timeout to re-prompt later.
-        incomplete_type: Optional[Literal["short", "long"]] = None
+        incomplete_type: IncompleteType | None = None
         if USER_TURN_INCOMPLETE_SHORT_MARKER in self._turn_text_buffer:
-            incomplete_type = "short"
+            incomplete_type = IncompleteType.SHORT
         elif USER_TURN_INCOMPLETE_LONG_MARKER in self._turn_text_buffer:
-            incomplete_type = "long"
+            incomplete_type = IncompleteType.LONG
 
         if incomplete_type:
             marker = (
                 USER_TURN_INCOMPLETE_SHORT_MARKER
-                if incomplete_type == "short"
+                if incomplete_type == IncompleteType.SHORT
                 else USER_TURN_INCOMPLETE_LONG_MARKER
             )
             logger.debug(
-                f"INCOMPLETE {incomplete_type.upper()} ({marker}) detected, suppressing text"
+                f"INCOMPLETE {incomplete_type.value.upper()} ({marker}) detected, suppressing text"
             )
-            self._turn_suppressed = True
+            self._turn_marker = TurnMarker.INCOMPLETE
 
-            # Push the marker with skip_tts=True so it's added to context (maintains
-            # conversation continuity per prompt instructions) but not spoken by TTS
-            frame = LLMTextFrame(self._turn_text_buffer)
-            frame.skip_tts = True
-            await self.push_frame(frame)
+            # No UserTurnInferenceCompletedFrame is broadcast here: the turn is
+            # explicitly not complete. The re-prompt path is driven by
+            # this mixin's own timeout.
+
+            # Persist the marker to context as a stand-alone assistant
+            # message via LLMMarkerFrame: the bot produces no spoken
+            # output for incomplete turns, so the marker is the entire
+            # context entry.
+            await self.push_frame(LLMMarkerFrame(marker))
 
             self._turn_text_buffer = ""
             await self._start_incomplete_timeout(incomplete_type)
@@ -402,16 +536,34 @@ class UserTurnCompletionLLMServiceMixin:
         if USER_TURN_COMPLETE_MARKER in self._turn_text_buffer:
             logger.debug(f"COMPLETE ({USER_TURN_COMPLETE_MARKER}) detected, pushing buffered text")
 
+            # Latch: this user turn now has its one spoken completion. Later
+            # duplicate inferences within the same turn are dropped by the guard
+            # at the top of this method.
+            self._user_turn_completion_voiced = True
+
+            # Any pending incomplete timeout was already cancelled when this
+            # response's LLMFullResponseStartFrame arrived (see ``push_frame``).
+
+            # Broadcast that the user turn is complete so a stop strategy
+            # gating finalization on this signal (e.g.
+            # LLMTurnCompletionUserTurnStopStrategy) can fire
+            # `on_user_turn_stopped`. Must fire before the marker so
+            # downstream consumers see the signal before the response.
+            # Idempotent: a tool call earlier in the turn may have
+            # already broadcast.
+            await self._broadcast_turn_completion()
+
+            # Push the marker as a sideband signal that the assistant
+            # aggregator will prepend to the upcoming aggregated text,
+            # so the context message ends up as "✓ <response>".
+            await self.push_frame(
+                LLMMarkerFrame(USER_TURN_COMPLETE_MARKER, append_to_context_immediately=False)
+            )
+
             # Split buffer at the marker to handle cases where marker and text
             # arrive in the same chunk (e.g., "✓ Hello!" from some LLMs)
             marker_pos = self._turn_text_buffer.index(USER_TURN_COMPLETE_MARKER)
             marker_end = marker_pos + len(USER_TURN_COMPLETE_MARKER)
-
-            # Push the marker with skip_tts=True - adds to context but not spoken
-            marker_text = self._turn_text_buffer[:marker_end]
-            frame = LLMTextFrame(marker_text)
-            frame.skip_tts = True
-            await self.push_frame(frame)
 
             # Push remaining text after marker as normal speech
             remaining_text = self._turn_text_buffer[marker_end:]
@@ -424,5 +576,5 @@ class UserTurnCompletionLLMServiceMixin:
 
             # Mark complete - all subsequent text flows through immediately
             self._turn_text_buffer = ""
-            self._turn_complete_found = True
+            self._turn_marker = TurnMarker.COMPLETE
             return

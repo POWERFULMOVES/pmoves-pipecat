@@ -8,10 +8,9 @@
 
 import base64
 import json
-from typing import Optional
+from typing import cast
 
 from loguru import logger
-from pydantic import BaseModel
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.audio.utils import create_stream_resampler, pcm_to_ulaw, ulaw_to_pcm
@@ -53,16 +52,16 @@ class PlivoFrameSerializer(FrameSerializer):
         """
 
         plivo_sample_rate: int = 8000
-        sample_rate: Optional[int] = None
+        sample_rate: int | None = None
         auto_hang_up: bool = True
 
     def __init__(
         self,
         stream_id: str,
-        call_id: Optional[str] = None,
-        auth_id: Optional[str] = None,
-        auth_token: Optional[str] = None,
-        params: Optional[InputParams] = None,
+        call_id: str | None = None,
+        auth_id: str | None = None,
+        auth_token: str | None = None,
+        params: InputParams | None = None,
     ):
         """Initialize the PlivoFrameSerializer.
 
@@ -73,7 +72,24 @@ class PlivoFrameSerializer(FrameSerializer):
             auth_token: Plivo auth token (required for auto hang-up).
             params: Configuration parameters.
         """
-        super().__init__(params or PlivoFrameSerializer.InputParams())
+        params = params or PlivoFrameSerializer.InputParams()
+        super().__init__(params)
+        self._params: PlivoFrameSerializer.InputParams = params
+
+        # Validate hangup-related parameters if auto_hang_up is enabled
+        if self._params.auto_hang_up:
+            missing_credentials = []
+            if not call_id:
+                missing_credentials.append("call_id")
+            if not auth_id:
+                missing_credentials.append("auth_id")
+            if not auth_token:
+                missing_credentials.append("auth_token")
+
+            if missing_credentials:
+                raise ValueError(
+                    f"auto_hang_up is enabled but missing required parameters: {', '.join(missing_credentials)}"
+                )
 
         self._stream_id = stream_id
         self._call_id = call_id
@@ -83,8 +99,12 @@ class PlivoFrameSerializer(FrameSerializer):
         self._plivo_sample_rate = self._params.plivo_sample_rate
         self._sample_rate = 0  # Pipeline input rate
 
-        self._input_resampler = create_stream_resampler()
-        self._output_resampler = create_stream_resampler()
+        self._input_resampler = create_stream_resampler(
+            clear_after_secs=self._params.resampler_clear_after_secs
+        )
+        self._output_resampler = create_stream_resampler(
+            clear_after_secs=self._params.resampler_clear_after_secs
+        )
         self._hangup_attempted = False
 
     async def setup(self, frame: StartFrame):
@@ -154,23 +174,11 @@ class PlivoFrameSerializer(FrameSerializer):
         try:
             import aiohttp
 
-            auth_id = self._auth_id
-            auth_token = self._auth_token
-            call_id = self._call_id
-
-            if not call_id or not auth_id or not auth_token:
-                missing = []
-                if not call_id:
-                    missing.append("call_id")
-                if not auth_id:
-                    missing.append("auth_id")
-                if not auth_token:
-                    missing.append("auth_token")
-
-                logger.warning(
-                    f"Cannot hang up Plivo call: missing required parameters: {', '.join(missing)}"
-                )
-                return
+            # __init__ guarantees these are non-None whenever auto_hang_up is True,
+            # which is the only path that reaches this method.
+            auth_id = cast(str, self._auth_id)
+            auth_token = cast(str, self._auth_token)
+            call_id = cast(str, self._call_id)
 
             # Plivo API endpoint for hanging up calls
             endpoint = f"https://api.plivo.com/v1/Account/{auth_id}/Call/{call_id}/"

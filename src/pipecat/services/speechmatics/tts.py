@@ -7,7 +7,8 @@
 """Speechmatics TTS service integration."""
 
 import asyncio
-from typing import AsyncGenerator, Optional
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
 from urllib.parse import urlencode
 
 import aiohttp
@@ -18,10 +19,10 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     TTSAudioRawFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
 )
+from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
 from pipecat.services.tts_service import TTSService
+from pipecat.utils.deprecation import deprecated
 from pipecat.utils.network import exponential_backoff_time
 from pipecat.utils.tracing.service_decorators import traced_tts
 
@@ -29,10 +30,22 @@ try:
     from speechmatics.rt import __version__
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
-    logger.error(
-        "In order to use Speechmatics, you need to `pip install pipecat-ai[speechmatics]`."
-    )
-    raise Exception(f"Missing module: {e}")
+    logger.error('In order to use Speechmatics, you need to `uv add "pipecat-ai[speechmatics]"`.')
+    raise ImportError(f"Missing module: {e}") from e
+
+
+@dataclass
+class SpeechmaticsTTSSettings(TTSSettings):
+    """Settings for SpeechmaticsTTSService.
+
+    Parameters:
+        max_retries: Maximum number of retries for HTTP requests.
+    """
+
+    # Speechmatics requires a voice (the URL path includes it), so narrow
+    # the inherited TTSSettings.voice field to disallow None.
+    voice: str | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_retries: int | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class SpeechmaticsTTSService(TTSService):
@@ -42,10 +55,21 @@ class SpeechmaticsTTSService(TTSService):
     It converts text to speech and returns raw PCM audio data for real-time playback.
     """
 
+    Settings = SpeechmaticsTTSSettings
+    _settings: Settings
+
     SPEECHMATICS_SAMPLE_RATE = 16000
 
+    @deprecated(
+        "`SpeechmaticsTTSService.InputParams` is deprecated since 0.0.105 and will be removed in "
+        "2.0.0. Use `SpeechmaticsTTSService.Settings` instead."
+    )
     class InputParams(BaseModel):
         """Optional input parameters for Speechmatics TTS configuration.
+
+        .. deprecated:: 0.0.105
+            Use ``settings=SpeechmaticsTTSService.Settings(...)`` instead.
+            Will be removed in 2.0.0.
 
         Parameters:
             max_retries: Maximum number of retries for TTS requests. Defaults to 5.
@@ -58,10 +82,11 @@ class SpeechmaticsTTSService(TTSService):
         *,
         api_key: str,
         base_url: str = "https://preview.tts.speechmatics.com",
-        voice_id: str = "sarah",
+        voice_id: str | None = None,
         aiohttp_session: aiohttp.ClientSession,
-        sample_rate: Optional[int] = SPEECHMATICS_SAMPLE_RATE,
-        params: Optional[InputParams] = None,
+        sample_rate: int | None = SPEECHMATICS_SAMPLE_RATE,
+        params: InputParams | None = None,
+        settings: Settings | None = None,
         **kwargs,
     ):
         """Initialize the Speechmatics TTS service.
@@ -70,9 +95,21 @@ class SpeechmaticsTTSService(TTSService):
             api_key: Speechmatics API key for authentication.
             base_url: Base URL for Speechmatics TTS API.
             voice_id: Voice model to use for synthesis.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SpeechmaticsTTSService.Settings(voice=...)`` instead.
+                    Will be removed in 2.0.0.
+
             aiohttp_session: Shared aiohttp session for HTTP requests.
             sample_rate: Audio sample rate in Hz.
-            params: Optional[InputParams]: Input parameters for the service.
+            params: Input parameters for the service.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SpeechmaticsTTSService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
+
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional arguments passed to TTSService.
         """
         if sample_rate and sample_rate != self.SPEECHMATICS_SAMPLE_RATE:
@@ -80,7 +117,37 @@ class SpeechmaticsTTSService(TTSService):
                 f"Speechmatics TTS only supports {self.SPEECHMATICS_SAMPLE_RATE}Hz sample rate. "
                 f"Current rate of {sample_rate}Hz may cause issues."
             )
-        super().__init__(sample_rate=sample_rate, **kwargs)
+
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(
+            model=None,
+            voice="sarah",
+            language=None,
+            max_retries=5,
+        )
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if voice_id is not None:
+            self._warn_init_param_moved_to_settings("voice_id", "voice")
+            default_settings.voice = voice_id
+
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            self._warn_init_param_moved_to_settings("params")
+            if not settings:
+                default_settings.max_retries = params.max_retries
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(
+            sample_rate=sample_rate,
+            push_start_frame=True,
+            push_stop_frames=True,
+            settings=default_settings,
+            **kwargs,
+        )
 
         # Service parameters
         self._api_key: str = api_key
@@ -90,12 +157,6 @@ class SpeechmaticsTTSService(TTSService):
         # Check we have required attributes
         if not self._api_key:
             raise ValueError("Missing Speechmatics API key")
-
-        # Default parameters
-        self._params = params or SpeechmaticsTTSService.InputParams()
-
-        # Set voice from constructor parameter
-        self.set_voice(voice_id)
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -117,7 +178,6 @@ class SpeechmaticsTTSService(TTSService):
             Frame: Audio frames containing the synthesized speech.
         """
         # Log the TTS started frame
-        logger.debug(f"{self}: Generating TTS [{text}]")
 
         # HTTP headers
         headers = {
@@ -131,12 +191,11 @@ class SpeechmaticsTTSService(TTSService):
         }
 
         # Complete HTTP URL
-        url = _get_endpoint_url(self._base_url, self._voice_id, self.sample_rate)
+        url = _get_endpoint_url(
+            self._base_url, assert_given(self._settings.voice), self.sample_rate
+        )
 
         try:
-            # Start TTS TTFB metrics
-            await self.start_ttfb_metrics()
-
             # Track attempt
             attempt = 0
 
@@ -159,7 +218,8 @@ class SpeechmaticsTTSService(TTSService):
                             attempt += 1
 
                             # Check if we've exceeded the maximum number of attempts
-                            if attempt >= self._params.max_retries:
+                            max_retries = assert_given(self._settings.max_retries)
+                            if max_retries is not None and attempt >= max_retries:
                                 raise ValueError()
 
                             # Report error frame
@@ -186,9 +246,6 @@ class SpeechmaticsTTSService(TTSService):
 
                     # Update Pipecat metrics
                     await self.start_tts_usage_metrics(text)
-
-                    # Emit the TTS started frame
-                    yield TTSStartedFrame(context_id=context_id)
 
                     # Process the response in streaming chunks
                     first_chunk = True
@@ -226,8 +283,7 @@ class SpeechmaticsTTSService(TTSService):
         except Exception as e:
             yield ErrorFrame(error=f"Error generating TTS: {e}")
         finally:
-            # Emit the TTS stopped frame
-            yield TTSStoppedFrame(context_id=context_id)
+            await self.stop_ttfb_metrics()
 
 
 def _get_endpoint_url(base_url: str, voice: str, sample_rate: int) -> str:

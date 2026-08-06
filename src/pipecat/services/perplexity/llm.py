@@ -11,13 +11,21 @@ an OpenAI-compatible interface. It handles Perplexity's unique token usage
 reporting patterns while maintaining compatibility with the Pipecat framework.
 """
 
-from openai import NOT_GIVEN
+from dataclasses import dataclass
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
+from pipecat.adapters.services.perplexity_adapter import PerplexityLLMAdapter
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
+
+
+@dataclass
+class PerplexityLLMSettings(BaseOpenAILLMService.Settings):
+    """Settings for PerplexityLLMService."""
+
+    pass
 
 
 class PerplexityLLMService(OpenAILLMService):
@@ -25,15 +33,25 @@ class PerplexityLLMService(OpenAILLMService):
 
     This service extends OpenAILLMService to work with Perplexity's API while maintaining
     compatibility with the OpenAI-style interface. It specifically handles the difference
-    in token usage reporting between Perplexity (incremental) and OpenAI (final summary).
+    in token usage reporting between Perplexity (a cumulative snapshot on every streamed
+    chunk) and OpenAI (a final summary).
     """
+
+    adapter_class = PerplexityLLMAdapter
+    # Perplexity doesn't support the "developer" message role.
+    # This value is used by BaseOpenAILLMService when calling the adapter.
+    supports_developer_role = False
+
+    Settings = PerplexityLLMSettings
+    _settings: Settings
 
     def __init__(
         self,
         *,
         api_key: str,
         base_url: str = "https://api.perplexity.ai",
-        model: str = "sonar",
+        model: str | None = None,
+        settings: Settings | None = None,
         **kwargs,
     ):
         """Initialize the Perplexity LLM service.
@@ -42,15 +60,33 @@ class PerplexityLLMService(OpenAILLMService):
             api_key: The API key for accessing Perplexity's API.
             base_url: The base URL for Perplexity's API. Defaults to "https://api.perplexity.ai".
             model: The model identifier to use. Defaults to "sonar".
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=PerplexityLLMService.Settings(model=...)`` instead.
+                    Will be removed in 2.0.0.
+
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
-        super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
-        # Counters for accumulating token usage metrics
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
-        self._has_reported_prompt_tokens = False
-        self._is_processing = False
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(model="sonar")
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            self._warn_init_param_moved_to_settings("model", "model")
+            default_settings.model = model
+
+        # 3. (No step 3, as there's no params object to apply)
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(api_key=api_key, base_url=base_url, settings=default_settings, **kwargs)
+        # Perplexity repeats a cumulative usage snapshot on every streamed chunk,
+        # so the latest one holds the totals for the whole completion.
+        self._token_usage: LLMTokenUsage | None = None
 
     def build_chat_completion_params(self, params_from_context: OpenAILLMInvocationParams) -> dict:
         """Build parameters for Perplexity chat completion request.
@@ -66,75 +102,51 @@ class PerplexityLLMService(OpenAILLMService):
             Dictionary of parameters for the chat completion request.
         """
         params = {
-            "model": self.model_name,
+            "model": self._settings.model,
             "stream": True,
             "messages": params_from_context["messages"],
         }
 
         # Add OpenAI-compatible parameters if they're set
-        if self._settings["frequency_penalty"] is not NOT_GIVEN:
-            params["frequency_penalty"] = self._settings["frequency_penalty"]
-        if self._settings["presence_penalty"] is not NOT_GIVEN:
-            params["presence_penalty"] = self._settings["presence_penalty"]
-        if self._settings["temperature"] is not NOT_GIVEN:
-            params["temperature"] = self._settings["temperature"]
-        if self._settings["top_p"] is not NOT_GIVEN:
-            params["top_p"] = self._settings["top_p"]
-        if self._settings["max_tokens"] is not NOT_GIVEN:
-            params["max_tokens"] = self._settings["max_tokens"]
+        if self._settings.frequency_penalty is not None:
+            params["frequency_penalty"] = self._settings.frequency_penalty
+        if self._settings.presence_penalty is not None:
+            params["presence_penalty"] = self._settings.presence_penalty
+        if self._settings.temperature is not None:
+            params["temperature"] = self._settings.temperature
+        if self._settings.top_p is not None:
+            params["top_p"] = self._settings.top_p
+        if self._settings.max_tokens is not None:
+            params["max_tokens"] = self._settings.max_tokens
 
         return params
 
-    async def _process_context(self, context: OpenAILLMContext | LLMContext):
-        """Process a context through the LLM and accumulate token usage metrics.
-
-        This method overrides the parent class implementation to handle
-        Perplexity's incremental token reporting style, accumulating the counts
-        and reporting them once at the end of processing.
+    async def _process_context(self, context: LLMContext):
+        """Process a context through the LLM, reporting usage once per completion.
 
         Args:
             context: The context to process, containing messages and other
                 information needed for the LLM interaction.
         """
-        # Reset all counters and flags at the start of processing
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
-        self._total_tokens = 0
-        self._has_reported_prompt_tokens = False
-        self._is_processing = True
+        self._token_usage = None
 
         try:
             await super()._process_context(context)
         finally:
-            self._is_processing = False
-            # Report final accumulated token usage at the end of processing
-            if self._prompt_tokens > 0 or self._completion_tokens > 0:
-                self._total_tokens = self._prompt_tokens + self._completion_tokens
-                tokens = LLMTokenUsage(
-                    prompt_tokens=self._prompt_tokens,
-                    completion_tokens=self._completion_tokens,
-                    total_tokens=self._total_tokens,
-                )
-                await super().start_llm_usage_metrics(tokens)
+            # Only the base implementation emits the metrics; report through it
+            # even if the response is interrupted or cancelled mid-stream.
+            if self._token_usage:
+                await super().start_llm_usage_metrics(self._token_usage)
+                self._token_usage = None
 
     async def start_llm_usage_metrics(self, tokens: LLMTokenUsage):
-        """Accumulate token usage metrics during processing.
+        """Hold the latest usage snapshot rather than reporting it.
 
-        Perplexity reports token usage incrementally during streaming,
-        unlike OpenAI which provides a final summary. We accumulate the
-        counts and report the total at the end of processing.
+        The inherited streaming loop calls this for every chunk carrying usage.
+        Holding the snapshot here suppresses that per-chunk reporting, leaving
+        :meth:`_process_context` to report the final one when the completion ends.
 
         Args:
-            tokens: Token usage information to accumulate.
+            tokens: Cumulative token usage for the completion so far.
         """
-        if not self._is_processing:
-            return
-
-        # Record prompt tokens the first time we see them
-        if not self._has_reported_prompt_tokens and tokens.prompt_tokens > 0:
-            self._prompt_tokens = tokens.prompt_tokens
-            self._has_reported_prompt_tokens = True
-
-        # Update completion tokens count if it has increased
-        if tokens.completion_tokens > self._completion_tokens:
-            self._completion_tokens = tokens.completion_tokens
+        self._token_usage = tokens

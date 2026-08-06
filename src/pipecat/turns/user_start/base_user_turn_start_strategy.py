@@ -6,12 +6,12 @@
 
 """Base turn start strategy for determining when the user starts speaking."""
 
+import warnings
 from dataclasses import dataclass
-from typing import Optional, Type
 
 from pipecat.frames.frames import Frame
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.utils.asyncio.task_manager import BaseTaskManager
+from pipecat.turns.types import ProcessFrameResult
 from pipecat.utils.base_object import BaseObject
 
 
@@ -23,7 +23,7 @@ class UserTurnStartedParams:
     contextual information about how the user turn should be handled by the user
     aggregator.
 
-    Attributes:
+    Parameters:
         enable_user_speaking_frames: Whether the user aggregator should emit
             frames indicating user speaking state (e.g., user started speaking)
             during the bot's turn. This is typically enabled by default, but may
@@ -72,35 +72,59 @@ class BaseUserTurnStartStrategy(BaseObject):
         super().__init__(**kwargs)
         self._enable_interruptions = enable_interruptions
         self._enable_user_speaking_frames = enable_user_speaking_frames
-        self._task_manager: Optional[BaseTaskManager] = None
         self._register_event_handler("on_push_frame", sync=True)
         self._register_event_handler("on_broadcast_frame", sync=True)
         self._register_event_handler("on_user_turn_started", sync=True)
+        self._register_event_handler("on_reset_aggregation", sync=True)
 
-    @property
-    def task_manager(self) -> BaseTaskManager:
-        """Returns the configured task manager."""
-        if not self._task_manager:
-            raise RuntimeError(f"{self} user turn start strategy was not properly setup")
-        return self._task_manager
-
-    async def setup(self, task_manager: BaseTaskManager):
-        """Initialize the strategy with the given task manager.
-
-        Args:
-            task_manager: The task manager to be associated with this instance.
-        """
-        self._task_manager = task_manager
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # reset() is deprecated.
+        if cls.reset is not BaseUserTurnStartStrategy.reset:
+            warnings.warn(
+                f"`{cls.__name__}` overrides `reset`, which is deprecated since 1.6.0 "
+                "and will be removed in 2.0.0. Override `handle_user_turn_started` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
     async def cleanup(self):
         """Cleanup the strategy."""
         pass
 
     async def reset(self):
-        """Reset the strategy to its initial state."""
+        """Reset the strategy to its initial state.
+
+        .. deprecated:: 1.6.0
+            Use :meth:`handle_user_turn_started` instead. Will be removed in
+            2.0.0.
+
+        For a start strategy this only ever ran at turn start, so its work *is*
+        "on turn start" — which is exactly what :meth:`handle_user_turn_started`
+        names. New strategies should override that callback directly.
+        """
         pass
 
-    async def process_frame(self, frame: Frame):
+    async def handle_user_turn_started(self):
+        """Notify the strategy that a user turn has started.
+
+        The controller calls this on every start strategy when a turn begins.
+        Override to run, for example, logic to reset state and prepare for the
+        next detection.
+        """
+        # Backward compatibility: a custom strategy may still override the
+        # deprecated reset(); invoke it here (the base reset() is a no-op).
+        await self.reset()
+
+    async def handle_user_turn_stopped(self):
+        """Notify the strategy that the user turn has stopped.
+
+        The controller calls this on every start strategy when a turn ends.
+        Override if the strategy needs to act on turn end (likely uncommon).
+        """
+        pass
+
+    async def process_frame(self, frame: Frame) -> ProcessFrameResult | None:
         """Process an incoming frame.
 
         Subclasses should override this to implement logic that decides whether
@@ -108,6 +132,10 @@ class BaseUserTurnStartStrategy(BaseObject):
 
         Args:
             frame: The frame to be processed.
+
+        Returns:
+            A ProcessFrameResult indicating the outcome, or None (treated as
+            CONTINUE for backward compatibility).
         """
         pass
 
@@ -120,7 +148,7 @@ class BaseUserTurnStartStrategy(BaseObject):
         """
         await self._call_event_handler("on_push_frame", frame, direction)
 
-    async def broadcast_frame(self, frame_cls: Type[Frame], **kwargs):
+    async def broadcast_frame(self, frame_cls: type[Frame], **kwargs):
         """Emit on_broadcast_frame to broadcast a frame using the user aggreagtor.
 
         Args:
@@ -138,3 +166,7 @@ class BaseUserTurnStartStrategy(BaseObject):
                 enable_user_speaking_frames=self._enable_user_speaking_frames,
             ),
         )
+
+    async def trigger_reset_aggregation(self):
+        """Trigger the `on_reset_aggregation` event."""
+        await self._call_event_handler("on_reset_aggregation")

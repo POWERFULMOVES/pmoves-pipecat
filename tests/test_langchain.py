@@ -6,12 +6,13 @@
 
 import unittest
 
-from langchain.prompts import ChatPromptTemplate
 from langchain_core.language_models import FakeStreamingListLLM
+from langchain_core.prompts import ChatPromptTemplate
 
 from pipecat.frames.frames import (
     InterruptionFrame,
     LLMContextAssistantTimestampFrame,
+    LLMContextAssistantTurnFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
@@ -96,6 +97,7 @@ class TestLangchain(unittest.IsolatedAsyncioTestCase):
             UserStoppedSpeakingFrame,
             LLMContextFrame,
             LLMContextAssistantTimestampFrame,
+            LLMContextAssistantTurnFrame,
         ]
         await run_test(
             pipeline,

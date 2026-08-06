@@ -8,9 +8,16 @@
 
 This module provides integration with Coqui XTTS streaming server for
 text-to-speech synthesis using local Docker deployment.
+
+.. deprecated:: 1.7.0
+    No replacement. :class:`~pipecat.services.kokoro.tts.KokoroTTSService` and
+    :class:`~pipecat.services.piper.tts.PiperTTSService` are the maintained
+    local TTS services. Will be removed in 2.0.0.
 """
 
-from typing import Any, AsyncGenerator, Dict, Optional
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 from loguru import logger
@@ -21,11 +28,11 @@ from pipecat.frames.frames import (
     Frame,
     StartFrame,
     TTSAudioRawFrame,
-    TTSStartedFrame,
-    TTSStoppedFrame,
 )
+from pipecat.services.settings import TTSSettings, assert_given
 from pipecat.services.tts_service import TTSService
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_tts
 
 # The server below can connect to XTTS through a local running docker
@@ -36,14 +43,17 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 # https://github.com/coqui-ai/xtts-streaming-server
 
 
-def language_to_xtts_language(language: Language) -> Optional[str]:
+def language_to_xtts_language(language: Language) -> str:
     """Convert a Language enum to XTTS language code.
 
     Args:
         language: The Language enum value to convert.
 
     Returns:
-        The corresponding XTTS language code, or None if not supported.
+        The corresponding service language code. If ``language`` is not in
+        the verified mapping, falls back to the base language code (e.g.,
+        ``en`` from ``en-US``) and logs a warning (via
+        ``resolve_language(..., use_base_code=True)``).
     """
     LANGUAGE_MAP = {
         Language.CS: "cs",
@@ -68,42 +78,99 @@ def language_to_xtts_language(language: Language) -> Optional[str]:
     return resolve_language(language, LANGUAGE_MAP, use_base_code=True)
 
 
+@dataclass
+class XTTSTTSSettings(TTSSettings):
+    """Settings for XTTSService."""
+
+    pass
+
+
+@deprecated(
+    "`XTTSService` is deprecated since 1.7.0 and will be removed in 2.0.0. No replacement. "
+    "`KokoroTTSService` and `PiperTTSService` are the maintained local TTS services."
+)
 class XTTSService(TTSService):
     """Coqui XTTS text-to-speech service.
 
     Provides text-to-speech synthesis using a locally running Coqui XTTS
     streaming server. Supports multiple languages and voice cloning through
     studio speakers configuration.
+
+    .. deprecated:: 1.7.0
+        No replacement. :class:`~pipecat.services.kokoro.tts.KokoroTTSService` and
+        :class:`~pipecat.services.piper.tts.PiperTTSService` are the maintained
+        local TTS services. Will be removed in 2.0.0.
     """
+
+    Settings = XTTSTTSSettings
+    _settings: Settings
 
     def __init__(
         self,
         *,
-        voice_id: str,
+        voice_id: str | None = None,
         base_url: str,
         aiohttp_session: aiohttp.ClientSession,
         language: Language = Language.EN,
-        sample_rate: Optional[int] = None,
+        sample_rate: int | None = None,
+        settings: Settings | None = None,
         **kwargs,
     ):
         """Initialize the XTTS service.
 
         Args:
             voice_id: ID of the voice/speaker to use for synthesis.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=XTTSService.Settings(voice=...)`` instead.
+                    Will be removed in 2.0.0.
+
             base_url: Base URL of the XTTS streaming server.
             aiohttp_session: HTTP session for making requests to the server.
             language: Language for synthesis. Defaults to English.
+
+                .. deprecated:: 0.0.106
+                    Use ``settings=XTTSService.Settings(language=...)`` instead.
+                    Will be removed in 2.0.0.
+
             sample_rate: Audio sample rate. If None, uses default.
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional arguments passed to parent TTSService.
         """
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(
+            model=None,
+            voice=None,
+            language=Language.EN,
+        )
 
-        self._settings = {
-            "language": self.language_to_service_language(language),
-            "base_url": base_url,
-        }
-        self.set_voice(voice_id)
-        self._studio_speakers: Optional[Dict[str, Any]] = None
+        # 2. Apply direct init arg overrides (deprecated)
+        if voice_id is not None:
+            self._warn_init_param_moved_to_settings("voice_id", "voice")
+            default_settings.voice = voice_id
+        if language is not None:
+            self._warn_init_param_moved_to_settings("language", "language")
+            default_settings.language = language
+
+        # 3. (No step 3, as there's no params object to apply)
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(
+            sample_rate=sample_rate,
+            push_start_frame=True,
+            push_stop_frames=True,
+            settings=default_settings,
+            **kwargs,
+        )
+
+        # Init-only fields (not runtime-updatable)
+        self._base_url = base_url
+
+        self._studio_speakers: dict[str, Any] | None = None
         self._aiohttp_session = aiohttp_session
 
         self._resampler = create_stream_resampler()
@@ -116,7 +183,7 @@ class XTTSService(TTSService):
         """
         return True
 
-    def language_to_service_language(self, language: Language) -> Optional[str]:
+    def language_to_service_language(self, language: Language) -> str | None:
         """Convert a Language enum to XTTS service language format.
 
         Args:
@@ -138,7 +205,7 @@ class XTTSService(TTSService):
         if self._studio_speakers:
             return
 
-        async with self._aiohttp_session.get(self._settings["base_url"] + "/studio_speakers") as r:
+        async with self._aiohttp_session.get(self._base_url + "/studio_speakers") as r:
             if r.status != 200:
                 text = await r.text()
                 await self.push_error(
@@ -158,26 +225,26 @@ class XTTSService(TTSService):
         Yields:
             Frame: Audio frames containing the synthesized speech.
         """
-        logger.debug(f"{self}: Generating TTS [{text}]")
-
         if not self._studio_speakers:
             logger.error(f"{self} no studio speakers available")
             return
 
-        embeddings = self._studio_speakers[self._voice_id]
+        voice = assert_given(self._settings.voice)
+        if voice is None:
+            yield ErrorFrame(error="XTTS voice must be specified")
+            return
+        embeddings = self._studio_speakers[voice]
 
-        url = self._settings["base_url"] + "/tts_stream"
+        url = self._base_url + "/tts_stream"
 
         payload = {
             "text": text.replace(".", "").replace("*", ""),
-            "language": self._settings["language"],
+            "language": self._settings.language,
             "speaker_embedding": embeddings["speaker_embedding"],
             "gpt_cond_latent": embeddings["gpt_cond_latent"],
             "add_wav_header": False,
             "stream_chunk_size": 20,
         }
-
-        await self.start_ttfb_metrics()
 
         async with self._aiohttp_session.post(url, json=payload) as r:
             if r.status != 200:
@@ -186,8 +253,6 @@ class XTTSService(TTSService):
                 return
 
             await self.start_tts_usage_metrics(text)
-
-            yield TTSStartedFrame(context_id=context_id)
 
             CHUNK_SIZE = self.chunk_size
 
@@ -226,5 +291,3 @@ class XTTSService(TTSService):
                     resampled_audio, self.sample_rate, 1, context_id=context_id
                 )
                 yield frame
-
-            yield TTSStoppedFrame(context_id=context_id)

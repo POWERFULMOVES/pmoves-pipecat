@@ -29,7 +29,7 @@ async def test_openai_llm_emits_error_frame_on_timeout():
     primary LLM times out.
     """
     with patch.object(OpenAILLMService, "create_client"):
-        service = OpenAILLMService(model="gpt-4")
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
         service._client = AsyncMock()
 
         # Track pushed frames and errors
@@ -96,7 +96,7 @@ async def test_openai_llm_timeout_still_pushes_end_frame():
     The finally block should ensure proper cleanup regardless of timeout.
     """
     with patch.object(OpenAILLMService, "create_client"):
-        service = OpenAILLMService(model="gpt-4")
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
         service._client = AsyncMock()
 
         pushed_frames = []
@@ -137,7 +137,7 @@ async def test_openai_llm_stream_closed_on_cancellation():
     import asyncio
 
     with patch.object(OpenAILLMService, "create_client"):
-        service = OpenAILLMService(model="gpt-4")
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
         service._client = AsyncMock()
 
         # Track if close was called
@@ -171,8 +171,7 @@ async def test_openai_llm_stream_closed_on_cancellation():
         mock_stream = MockAsyncStream()
 
         # Mock the stream creation methods
-        service._stream_chat_completions_specific_context = AsyncMock(return_value=mock_stream)
-        service._stream_chat_completions_universal_context = AsyncMock(return_value=mock_stream)
+        service.get_chat_completions = AsyncMock(return_value=mock_stream)
         service.start_ttfb_metrics = AsyncMock()
         service.stop_ttfb_metrics = AsyncMock()
         service.start_llm_usage_metrics = AsyncMock()
@@ -196,7 +195,7 @@ async def test_openai_llm_emits_error_frame_on_exception():
     This enables proper error handling for API errors, rate limits, and other failures.
     """
     with patch.object(OpenAILLMService, "create_client"):
-        service = OpenAILLMService(model="gpt-4")
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
         service._client = AsyncMock()
 
         pushed_errors = []
@@ -223,3 +222,76 @@ async def test_openai_llm_emits_error_frame_on_exception():
         assert "Error during completion" in pushed_errors[0]["error_msg"]
         assert "API Error" in pushed_errors[0]["error_msg"]
         assert isinstance(pushed_errors[0]["exception"], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_openai_llm_async_iterator_closed_on_stream_end():
+    """Test that the async iterator is explicitly closed after stream consumption.
+
+    This prevents uvloop's broken asyncgen finalizer from firing on Python 3.12+
+    when async generators are garbage-collected without explicit cleanup.
+    See MagicStack/uvloop#699.
+    """
+    with patch.object(OpenAILLMService, "create_client"):
+        service = OpenAILLMService(settings=OpenAILLMService.Settings(model="gpt-4"))
+        service._client = AsyncMock()
+
+        # Track if the iterator's aclose was called
+        iterator_aclosed = False
+        stream_closed = False
+
+        class MockAsyncIterator:
+            """Mock async iterator that tracks aclose() calls."""
+
+            def __init__(self):
+                self.iteration_count = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.iteration_count += 1
+                if self.iteration_count > 2:
+                    raise StopAsyncIteration()
+                # Return a minimal chunk
+                mock_chunk = AsyncMock()
+                mock_chunk.usage = None
+                mock_chunk.model = None
+                mock_chunk.choices = []
+                return mock_chunk
+
+            async def aclose(self):
+                nonlocal iterator_aclosed
+                iterator_aclosed = True
+
+        class MockAsyncStream:
+            """Mock stream whose __aiter__ returns a separate iterator object."""
+
+            def __init__(self, iterator):
+                self._iterator = iterator
+
+            def __aiter__(self):
+                return self._iterator
+
+            async def close(self):
+                nonlocal stream_closed
+                stream_closed = True
+
+        mock_iterator = MockAsyncIterator()
+        mock_stream = MockAsyncStream(mock_iterator)
+
+        service.get_chat_completions = AsyncMock(return_value=mock_stream)
+        service.start_ttfb_metrics = AsyncMock()
+        service.stop_ttfb_metrics = AsyncMock()
+        service.start_llm_usage_metrics = AsyncMock()
+
+        context = LLMContext(
+            messages=[{"role": "user", "content": "Hello"}],
+        )
+
+        await service._process_context(context)
+
+        # Verify the iterator was explicitly closed (prevents uvloop crash)
+        assert iterator_aclosed, "Async iterator should be explicitly closed"
+        # Verify the stream was also closed (releases HTTP resources)
+        assert stream_closed, "Stream should be closed to release HTTP resources"

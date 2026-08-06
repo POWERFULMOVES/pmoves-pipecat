@@ -7,11 +7,10 @@
 """SambaNova LLM service implementation using OpenAI-compatible interface."""
 
 import json
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any
 
 from loguru import logger
-from openai import AsyncStream
-from openai.types.chat import ChatCompletionChunk
 
 from pipecat.adapters.services.open_ai_adapter import OpenAILLMInvocationParams
 from pipecat.frames.frames import (
@@ -19,10 +18,17 @@ from pipecat.frames.frames import (
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
 from pipecat.services.llm_service import FunctionCallFromLLM
+from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.utils.tracing.service_decorators import traced_llm
+
+
+@dataclass
+class SambaNovaLLMSettings(BaseOpenAILLMService.Settings):
+    """Settings for SambaNovaLLMService."""
+
+    pass
 
 
 class SambaNovaLLMService(OpenAILLMService):  # type: ignore
@@ -32,29 +38,58 @@ class SambaNovaLLMService(OpenAILLMService):  # type: ignore
     maintaining full compatibility with OpenAI's interface and functionality.
     """
 
+    # SambaNova doesn't support the "developer" message role.
+    # This value is used by BaseOpenAILLMService when calling the adapter.
+    supports_developer_role = False
+
+    Settings = SambaNovaLLMSettings
+    _settings: Settings
+
     def __init__(
         self,
         *,
         api_key: str,
-        model: str = "Llama-4-Maverick-17B-128E-Instruct",
+        model: str | None = None,
         base_url: str = "https://api.sambanova.ai/v1",
-        **kwargs: Dict[Any, Any],
+        settings: Settings | None = None,
+        **kwargs: dict[Any, Any],
     ) -> None:
         """Initialize SambaNova LLM service.
 
         Args:
             api_key: The API key for accessing SambaNova API.
-            model: The model identifier to use. Defaults to "Llama-4-Maverick-17B-128E-Instruct".
+            model: The model identifier to use. Defaults to "Meta-Llama-3.3-70B-Instruct".
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=SambaNovaLLMService.Settings(model=...)`` instead.
+                    Will be removed in 2.0.0.
+
             base_url: The base URL for SambaNova API. Defaults to "https://api.sambanova.ai/v1".
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
-        super().__init__(api_key=api_key, base_url=base_url, model=model, **kwargs)
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(model="Meta-Llama-3.3-70B-Instruct")
+
+        # 2. Apply direct init arg overrides (deprecated)
+        if model is not None:
+            self._warn_init_param_moved_to_settings("model", "model")
+            default_settings.model = model
+
+        # 3. (No step 3, as there's no params object to apply)
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(settings)
+
+        super().__init__(api_key=api_key, base_url=base_url, settings=default_settings, **kwargs)
 
     def create_client(
         self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        **kwargs: Dict[Any, Any],
+        api_key: str | None = None,
+        base_url: str | None = None,
+        **kwargs: dict[Any, Any],
     ) -> Any:
         """Create OpenAI-compatible client for SambaNova API endpoint.
 
@@ -84,25 +119,24 @@ class SambaNovaLLMService(OpenAILLMService):  # type: ignore
             Dictionary of parameters for the chat completion request.
         """
         params = {
-            "model": self.model_name,
+            "model": self._settings.model,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "temperature": self._settings["temperature"],
-            "top_p": self._settings["top_p"],
-            "max_tokens": self._settings["max_tokens"],
-            "max_completion_tokens": self._settings["max_completion_tokens"],
+            "temperature": self._settings.temperature,
+            "top_p": self._settings.top_p,
+            "max_tokens": self._settings.max_tokens,
+            "max_completion_tokens": self._settings.max_completion_tokens,
         }
 
         # Messages, tools, tool_choice
         params.update(params_from_context)
 
-        params.update(self._settings["extra"])
+        params.update(self._settings.extra)
+
         return params
 
     @traced_llm  # type: ignore
-    async def _process_context(
-        self, context: OpenAILLMContext | LLMContext
-    ) -> AsyncStream[ChatCompletionChunk]:
+    async def _process_context(self, context: LLMContext):
         """Process OpenAI LLM context and stream chat completion chunks.
 
         This method handles the streaming response from SambaNova API, including
@@ -111,9 +145,6 @@ class SambaNovaLLMService(OpenAILLMService):  # type: ignore
 
         Args:
             context: OpenAI LLM context containing conversation state and tools.
-
-        Returns:
-            Async stream of chat completion chunks.
         """
         functions_list = []
         arguments_list = []
@@ -125,11 +156,7 @@ class SambaNovaLLMService(OpenAILLMService):  # type: ignore
 
         await self.start_ttfb_metrics()
 
-        chunk_stream = await (
-            self._stream_chat_completions_specific_context(context)
-            if isinstance(context, OpenAILLMContext)
-            else self._stream_chat_completions_universal_context(context)
-        )
+        chunk_stream = await self.get_chat_completions(context)
 
         # Use context manager to ensure stream is closed on cancellation/exception.
         # Without this, CancelledError during iteration leaves the underlying socket open.
@@ -207,7 +234,11 @@ class SambaNovaLLMService(OpenAILLMService):  # type: ignore
                 if len(arguments) < 1:
                     continue
 
-                arguments = json.loads(arguments)
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError:
+                    logger.warning(f"{self}: Failed to parse function call arguments: {arguments}")
+                    continue
                 function_calls.append(
                     FunctionCallFromLLM(
                         context=context,

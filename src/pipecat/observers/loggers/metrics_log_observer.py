@@ -11,8 +11,6 @@ allowing developers to monitor performance metrics, token usage, and other
 statistics in real-time.
 """
 
-from typing import Optional, Set, Type
-
 from loguru import logger
 
 from pipecat.frames.frames import MetricsFrame
@@ -22,8 +20,11 @@ from pipecat.metrics.metrics import (
     MetricsData,
     ProcessingMetricsData,
     SmartTurnMetricsData,
+    STTUsageMetricsData,
+    TTFAMetricsData,
     TTFBMetricsData,
     TTSUsageMetricsData,
+    TurnMetricsData,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 
@@ -34,10 +35,12 @@ class MetricsLogObserver(BaseObserver):
     Monitors and logs all MetricsFrame instances, including:
 
     - TTFBMetricsData (Time To First Byte)
+    - TTFAMetricsData (Time To First Audio)
     - ProcessingMetricsData (General processing time)
     - LLMUsageMetricsData (Token usage statistics)
+    - STTUsageMetricsData (Speech-to-Text audio seconds)
     - TTSUsageMetricsData (Text-to-Speech character counts)
-    - SmartTurnMetricsData (Turn prediction metrics)
+    - TurnMetricsData (Turn prediction metrics)
 
     This allows developers to track performance metrics, token usage,
     and other statistics throughout the pipeline.
@@ -59,7 +62,7 @@ class MetricsLogObserver(BaseObserver):
 
     def __init__(
         self,
-        include_metrics: Optional[Set[Type[MetricsData]]] = None,
+        include_metrics: set[type[MetricsData]] | None = None,
         **kwargs,
     ):
         """Initialize the metrics log observer.
@@ -70,6 +73,17 @@ class MetricsLogObserver(BaseObserver):
             **kwargs: Additional arguments passed to parent class.
         """
         super().__init__(**kwargs)
+        # Normalize deprecated types in include_metrics
+        if include_metrics and SmartTurnMetricsData in include_metrics:
+            import warnings
+
+            warnings.warn(
+                "SmartTurnMetricsData is deprecated in include_metrics, "
+                "use TurnMetricsData instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            include_metrics = (include_metrics - {SmartTurnMetricsData}) | {TurnMetricsData}
         self._include_metrics = include_metrics
         self._frames_seen = set()
 
@@ -134,18 +148,28 @@ class MetricsLogObserver(BaseObserver):
             logger.debug(
                 f"📊 {processor_info} TTFB{model_info}: {metrics_data.value}s at {time_sec:.3f}s"
             )
+        elif isinstance(metrics_data, TTFAMetricsData):
+            logger.debug(
+                f"📊 {processor_info} TTFA{model_info}: {metrics_data.ttfa}s "
+                f"({metrics_data.leading_silence}s leading silence) at {time_sec:.3f}s"
+            )
         elif isinstance(metrics_data, ProcessingMetricsData):
             logger.debug(
                 f"📊 {processor_info} PROCESSING TIME{model_info}: {metrics_data.value}s at {time_sec:.3f}s"
             )
         elif isinstance(metrics_data, LLMUsageMetricsData):
             self._log_llm_usage(metrics_data, processor_info, model_info, time_sec)
+        elif isinstance(metrics_data, STTUsageMetricsData):
+            logger.debug(
+                f"📊 {processor_info} STT USAGE{model_info}: "
+                f"{metrics_data.value.audio_seconds:.3f}s audio at {time_sec:.3f}s"
+            )
         elif isinstance(metrics_data, TTSUsageMetricsData):
             logger.debug(
                 f"📊 {processor_info} TTS USAGE{model_info}: {metrics_data.value} characters at {time_sec:.3f}s"
             )
-        elif isinstance(metrics_data, SmartTurnMetricsData):
-            self._log_smart_turn(metrics_data, processor_info, model_info, time_sec)
+        elif isinstance(metrics_data, TurnMetricsData):
+            self._log_turn(metrics_data, processor_info, model_info, time_sec)
         else:
             # Generic fallback for unknown metrics types
             logger.debug(
@@ -185,34 +209,42 @@ class MetricsLogObserver(BaseObserver):
         if usage.reasoning_tokens is not None:
             details.append(f"reasoning: {usage.reasoning_tokens}")
 
+        if usage.input_audio_tokens is not None:
+            details.append(f"input_audio: {usage.input_audio_tokens}")
+
+        if usage.output_audio_tokens is not None:
+            details.append(f"output_audio: {usage.output_audio_tokens}")
+
+        if usage.cache_read_input_audio_tokens is not None:
+            details.append(f"cache_read_audio: {usage.cache_read_input_audio_tokens}")
+
         usage_str = ", ".join(details)
 
         logger.debug(
             f"📊 {processor_info} LLM TOKEN USAGE{model_info}: {usage_str} at {time_sec:.2f}s"
         )
 
-    def _log_smart_turn(
+    def _log_turn(
         self,
-        metrics_data: SmartTurnMetricsData,
+        metrics_data: TurnMetricsData,
         processor_info: str,
         model_info: str,
         time_sec: float,
     ):
-        """Log smart turn prediction metrics.
+        """Log turn prediction metrics.
 
         Args:
-            metrics_data: The smart turn metrics data.
+            metrics_data: The turn metrics data.
             processor_info: Formatted processor name string.
             model_info: Formatted model name string.
             time_sec: Timestamp in seconds.
         """
         complete_str = "COMPLETE" if metrics_data.is_complete else "INCOMPLETE"
+        e2e_str = f"{metrics_data.e2e_processing_time_ms:.1f}ms"
 
         logger.debug(
-            f"📊 {processor_info} SMART TURN{model_info}: {complete_str} "
+            f"📊 {processor_info} TURN{model_info}: {complete_str} "
             f"(probability: {metrics_data.probability:.2%}, "
-            f"inference: {metrics_data.inference_time_ms:.1f}ms, "
-            f"server: {metrics_data.server_total_time_ms:.1f}ms, "
-            f"e2e: {metrics_data.e2e_processing_time_ms:.1f}ms) "
+            f"e2e: {e2e_str}) "
             f"at {time_sec:.2f}s"
         )

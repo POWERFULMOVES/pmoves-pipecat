@@ -1,6 +1,11 @@
+---
+name: cleanup
+description: Review, refactor, document, and validate code changes in the current branch
+---
+
 # Code Cleanup Skill
 
-The **Code Cleanup Skill** reviews, refactors, and documents code changes in your current branch, ensuring alignment with **Pipecat’s architecture, coding standards, and example patterns**.
+The **Code Cleanup Skill** reviews, refactors, and documents code changes in your current branch, ensuring alignment with **Pipecat's architecture, coding standards, and example patterns**.
 It focuses on **readability, correctness, performance, and consistency**, while avoiding breaking changes.
 
 ---
@@ -28,9 +33,9 @@ This skill analyzes all changes introduced in your branch and performs the follo
 
 Invoke the skill using any of the following commands:
 
-- “Clean up my branch code”
-- “Refactor the changes in my branch”
-- “Review and improve my branch code”
+- "Clean up my branch code"
+- "Refactor the changes in my branch"
+- "Review and improve my branch code"
 - `/cleanup`
 
 ---
@@ -138,13 +143,13 @@ class InputParams(BaseModel):
 - Frame emission patterns
 - Metrics support:
   - `can_generate_metrics()`
-  - TTFB metrics
+  - TTFB and TTFA metrics
   - Usage metrics
 - Alignment with similar existing services
 
 #### Examples
 
-Validated against `examples/foundational/07-interruptible.py`:
+Validated against `examples/07-interruptible.py`:
 
 - Proper `create_transport()` usage
 - Correct pipeline structure
@@ -173,7 +178,9 @@ class ExampleTTSService(TTSService):
             await self.start_ttfb_metrics()
             yield TTSStartedFrame()
             # ... processing ...
-            yield TTSAudioRawFrame(...)
+            frame = TTSAudioRawFrame(...)
+            await self.process_ttfa_metrics(frame)
+            yield frame
         finally:
             await self.stop_ttfb_metrics()
 ```
@@ -226,6 +233,8 @@ async def bot(runner_args: RunnerArguments):
    - Pattern consistency
 4. Generate actionable recommendations
 5. Apply Pipecat standards
+6. Run `/prose-review branch` over the comments and docstrings written above, and fix
+   anything it flags
 
 ---
 
@@ -280,7 +289,7 @@ class NewTTSService(TTSService):
     - Text-to-speech synthesis
     - Streaming PCM audio
     - Voice customization
-    - TTFB metrics
+    - TTFB and TTFA metrics
     """
 
     def __init__(self, *, api_key: str, voice: str, **kwargs):

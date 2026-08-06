@@ -12,28 +12,28 @@ and JSON data to SageMaker model endpoints and receiving streaming responses.
 """
 
 import os
-from typing import Optional
 
 from loguru import logger
 
 try:
     from aws_sdk_sagemaker_runtime_http2.client import SageMakerRuntimeHTTP2Client
-    from aws_sdk_sagemaker_runtime_http2.config import Config, HTTPAuthSchemeResolver
+    from aws_sdk_sagemaker_runtime_http2.config import Config
     from aws_sdk_sagemaker_runtime_http2.models import (
         InvokeEndpointWithBidirectionalStreamInput,
+        InvokeEndpointWithBidirectionalStreamOutput,
         RequestPayloadPart,
+        RequestStreamEvent,
         RequestStreamEventPayloadPart,
         ResponseStreamEvent,
     )
-    from smithy_aws_core.auth.sigv4 import SigV4AuthScheme
     from smithy_aws_core.identity import EnvironmentCredentialsResolver
     from smithy_core.aio.eventstream import DuplexEventStream
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
-        "In order to use SageMaker BiDi client, you need to `pip install pipecat-ai[sagemaker]`."
+        'In order to use SageMaker BiDi client, you need to `uv add "pipecat-ai[sagemaker]"`.'
     )
-    raise Exception(f"Missing module: {e}")
+    raise ImportError(f"Missing module: {e}") from e
 
 
 class SageMakerBidiClient:
@@ -64,8 +64,8 @@ class SageMakerBidiClient:
         self,
         endpoint_name: str,
         region: str,
-        model_invocation_path: str = "",
-        model_query_string: str = "",
+        model_invocation_path: str | None = "",
+        model_query_string: str | None = "",
     ):
         """Initialize the SageMaker BiDi client.
 
@@ -80,19 +80,27 @@ class SageMakerBidiClient:
         self.model_invocation_path = model_invocation_path
         self.model_query_string = model_query_string
         self.bidi_endpoint = f"https://runtime.sagemaker.{region}.amazonaws.com:8443"
-        self._client: Optional[SageMakerRuntimeHTTP2Client] = None
-        self._stream: Optional[
-            DuplexEventStream[RequestStreamEventPayloadPart, ResponseStreamEvent, any]
-        ] = None
+        self._client: SageMakerRuntimeHTTP2Client | None = None
+        self._stream: (
+            DuplexEventStream[
+                RequestStreamEvent,
+                ResponseStreamEvent,
+                InvokeEndpointWithBidirectionalStreamOutput,
+            ]
+            | None
+        ) = None
         self._output_stream = None
         self._is_active = False
 
-    def _initialize_client(self):
+    def _initialize_client(self) -> SageMakerRuntimeHTTP2Client:
         """Initialize the SageMaker Runtime HTTP2 client with AWS credentials.
 
         Creates and configures the SageMaker Runtime HTTP2 client with SigV4
         authentication. Attempts to resolve AWS credentials from environment
         variables, AWS CLI configuration, or instance metadata.
+
+        Returns:
+            The initialized client, also stored on the instance.
         """
         logger.debug(f"Initializing SageMaker BiDi client for region: {self.region}")
         logger.debug(f"Using endpoint URI: {self.bidi_endpoint}")
@@ -107,14 +115,15 @@ class SageMakerBidiClient:
                 "AWS CLI configuration and instance metadata."
             )
 
+        # SigV4 auth for the sagemaker service is the Config default, so
+        # auth_schemes and auth_scheme_resolver are left unset.
         config = Config(
             endpoint_uri=self.bidi_endpoint,
             region=self.region,
             aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
-            auth_scheme_resolver=HTTPAuthSchemeResolver(),
-            auth_schemes={"aws.auth#sigv4": SigV4AuthScheme(service="sagemaker")},
         )
         self._client = SageMakerRuntimeHTTP2Client(config=config)
+        return self._client
 
     async def start_session(self):
         """Start a bidirectional streaming session with the SageMaker endpoint.
@@ -129,8 +138,7 @@ class SageMakerBidiClient:
         Raises:
             RuntimeError: If client initialization or connection fails.
         """
-        if not self._client:
-            self._initialize_client()
+        client = self._client or self._initialize_client()
 
         logger.debug(f"Starting BiDi session with endpoint: {self.endpoint_name}")
         logger.debug(f"Model invocation path: {self.model_invocation_path}")
@@ -144,9 +152,7 @@ class SageMakerBidiClient:
         )
 
         try:
-            self._stream = await self._client.invoke_endpoint_with_bidirectional_stream(
-                stream_input
-            )
+            self._stream = await client.invoke_endpoint_with_bidirectional_stream(stream_input)
             self._is_active = True
 
             # Get output stream
@@ -161,7 +167,7 @@ class SageMakerBidiClient:
             self._is_active = False
             raise RuntimeError(f"Failed to start SageMaker BiDi session: {e}")
 
-    async def send_data(self, data_bytes: bytes, data_type: Optional[str] = None):
+    async def send_data(self, data_bytes: bytes, data_type: str | None = None):
         """Send a chunk of data to the stream.
 
         Generic method for sending any type of data to the SageMaker endpoint.
@@ -232,7 +238,7 @@ class SageMakerBidiClient:
 
         await self.send_data(json.dumps(data).encode("utf-8"), data_type="UTF8")
 
-    async def receive_response(self) -> Optional[ResponseStreamEvent]:
+    async def receive_response(self) -> ResponseStreamEvent | None:
         """Receive a response from the stream.
 
         Blocks until a response is available from the SageMaker endpoint. Returns
