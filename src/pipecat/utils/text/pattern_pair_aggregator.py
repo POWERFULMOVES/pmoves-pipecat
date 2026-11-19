@@ -17,7 +17,8 @@ from enum import Enum
 
 from loguru import logger
 
-from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
+from pipecat.utils.string import longest_trailing_partial_match
+from pipecat.utils.text.base_text_aggregator import Aggregation, TextType
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 
 
@@ -115,9 +116,7 @@ class PatternPairAggregator(SimpleTextAggregator):
         pattern_start = self._match_start_of_pattern(self._text)
         stripped_text = self._text.strip()
         type = (
-            pattern_start[1].get("type", AggregationType.SENTENCE)
-            if pattern_start
-            else AggregationType.SENTENCE
+            pattern_start[1].get("type", TextType.SENTENCE) if pattern_start else TextType.SENTENCE
         )
         return Aggregation(text=stripped_text, type=type)
 
@@ -149,9 +148,9 @@ class PatternPairAggregator(SimpleTextAggregator):
         Returns:
             Self for method chaining.
         """
-        if type in [AggregationType.SENTENCE, AggregationType.WORD, AggregationType.TOKEN]:
+        if type in [TextType.SENTENCE, TextType.WORD, TextType.TOKEN]:
             raise ValueError(
-                f"The aggregation type '{type}' is reserved for default behavior and can not be used for custom patterns."
+                f"The text type '{type}' is reserved for default behavior and can not be used for custom patterns."
             )
         self._patterns[type] = {
             "start": start_pattern,
@@ -259,23 +258,46 @@ class PatternPairAggregator(SimpleTextAggregator):
             A tuple of (start_index, pattern_info) if an incomplete pattern is found,
             or None if no patterns are found or all patterns are complete.
         """
-        for type, pattern_info in self._patterns.items():
-            start = pattern_info["start"]
-            end = pattern_info["end"]
-
-            # Count occurrences
-            start_count = text.count(start)
-            end_count = text.count(end)
-
-            # If there are more starts than ends, we have incomplete patterns
-            # Again, this is written generically but there only ever should
-            # be one pattern active at a time, so the counts should be 0 or 1.
-            # Which is why we base the return on the first found.
-            if start_count > end_count:
-                start_index = text.find(start)
+        # Only one pattern should ever be open at a time, so the first found wins.
+        for pattern_info in self._patterns.values():
+            start_index = self._unmatched_start(text, pattern_info["start"], pattern_info["end"])
+            if start_index is not None:
                 return (start_index, pattern_info)
 
         return None
+
+    @staticmethod
+    def _unmatched_start(text: str, start: str, end: str) -> int | None:
+        """Find the first start delimiter in the text that has no end delimiter after it.
+
+        Delimiters are paired the way :meth:`_process_complete_patterns` pairs
+        them, left to right and non-overlapping, which also holds for a
+        delimiter that reads the same at both ends (a Markdown code fence).
+
+        Args:
+            text: The text to scan.
+            start: The start delimiter.
+            end: The end delimiter.
+
+        Returns:
+            The index of the unmatched start delimiter, or None if every start
+            delimiter is closed.
+        """
+        regex = f"{re.escape(start)}(.*?){re.escape(end)}"
+        matched_spans = [match.span() for match in re.finditer(regex, text, re.DOTALL)]
+
+        search_from = 0
+        while True:
+            index = text.find(start, search_from)
+            if index == -1:
+                return None
+
+            span = next((s for s in matched_spans if s[0] <= index < s[1]), None)
+            if span is None:
+                return index
+            # This occurrence belongs to a completed match; skip past it entirely
+            # so a start nested inside its content isn't mistaken for an unmatched one.
+            search_from = span[1]
 
     async def aggregate(self, text: str) -> AsyncIterator[PatternMatch]:
         """Aggregate text and process pattern pairs.
@@ -286,6 +308,10 @@ class PatternPairAggregator(SimpleTextAggregator):
 
         In TOKEN mode, pattern detection still works but non-pattern text is
         yielded as TOKEN aggregations instead of waiting for sentence boundaries.
+        Text ending in a partial start delimiter (e.g. ``<thin`` of
+        ``<think>``) is held back until a later chunk determines whether it
+        begins a pattern, so a delimiter split across chunks is still
+        recognized.
 
         Args:
             text: Text to aggregate.
@@ -337,16 +363,19 @@ class PatternPairAggregator(SimpleTextAggregator):
                 result = self._text[: pattern_start[0]]
                 self._text = self._text[pattern_start[0] :]
                 agg_type = (
-                    AggregationType.TOKEN
-                    if self._aggregation_type == AggregationType.TOKEN
-                    else AggregationType.SENTENCE
+                    TextType.TOKEN
+                    if self._aggregation_type == TextType.TOKEN
+                    else TextType.SENTENCE
                 )
                 yield PatternMatch(content=result.strip(), type=agg_type, full_match=result)
                 continue
 
-            if self._aggregation_type != AggregationType.TOKEN:
-                # Use parent's lookahead logic for sentence detection
-                aggregation = await super()._check_sentence_with_lookahead(char)
+            if self._aggregation_type != TextType.TOKEN:
+                # Use parent's lookahead logic for sentence detection, ignoring
+                # boundaries inside KEEP patterns that are still in the buffer.
+                aggregation = await super()._check_sentence_with_lookahead(
+                    char, protected_end=self._kept_patterns_offset()
+                )
                 if aggregation:
                     # Convert to PatternMatch for consistency with return type
                     yield PatternMatch(
@@ -356,15 +385,134 @@ class PatternPairAggregator(SimpleTextAggregator):
                     )
 
         # In TOKEN mode, yield any accumulated text after processing all chars,
-        # but only if there's no incomplete pattern being buffered.
-        if self._aggregation_type == AggregationType.TOKEN and self._text:
+        # but only if there's no incomplete pattern being buffered. A trailing
+        # partial start delimiter (e.g. "<thin" of "<think>") is held back so a
+        # delimiter split across chunks isn't leaked as plain text; it's
+        # retained in the buffer to be completed by the next chunk.
+        if self._aggregation_type == TextType.TOKEN and self._text:
             if self._match_start_of_pattern(self._text) is None:
-                yield PatternMatch(
-                    content=self._text,
-                    type=AggregationType.TOKEN,
-                    full_match=self._text,
+                held_back = longest_trailing_partial_match(
+                    self._text, [pattern["start"] for pattern in self._patterns.values()]
                 )
-                self._text = ""
+                yield_length = len(self._text) - held_back
+                if yield_length > 0:
+                    content = self._text[:yield_length]
+                    self._text = self._text[yield_length:]
+                    self._last_processed_position = len(self._text)
+                    yield PatternMatch(
+                        content=content,
+                        type=TextType.TOKEN,
+                        full_match=content,
+                    )
+
+    def _kept_patterns_offset(self) -> int:
+        """Return the buffer offset just past the last closed KEEP pattern, or 0 if none."""
+        end_patterns = [
+            pattern["end"]
+            for pattern in self._patterns.values()
+            if pattern["action"] == MatchAction.KEEP
+        ]
+        return max(
+            (
+                self._text.rfind(end_pattern) + len(end_pattern)
+                for end_pattern in end_patterns
+                if end_pattern in self._text
+            ),
+            default=0,
+        )
+
+    async def flush(self) -> Aggregation | None:
+        """Flush any remaining text in the buffer.
+
+        Degrades incomplete pattern state the same way a closed pair's
+        action would, without knowing whether the pair would ever have
+        closed:
+
+        - REMOVE and AGGREGATE: an unclosed start delimiter and everything
+          from it onward is dropped (their content is either stripped or
+          treated as a side channel once closed, so it's never spoken
+          incomplete). The pattern handler is not invoked. Text before the
+          earliest such unclosed start delimiter is kept.
+        - KEEP: a closed KEEP pair is spoken verbatim, delimiters included
+          (see :meth:`aggregate`), so an unclosed one degrades to the same
+          thing rather than being dropped.
+
+        If the buffer ends with a proper prefix of a REMOVE/AGGREGATE start
+        delimiter (the stream cut off mid-delimiter), that trailing partial
+        text is trimmed too. This accepts an inherent ambiguity: a legitimate
+        trailing character sequence that happens to match a delimiter prefix
+        (e.g. a stray ``<``) is trimmed the same way.
+
+        Returns:
+            Any remaining text with incomplete REMOVE/AGGREGATE pattern
+            content dropped, or None if there is nothing left to return.
+        """
+        cut_index = self._find_earliest_droppable_start(self._text)
+        result_text = self._text if cut_index is None else self._text[:cut_index]
+        result_text = self._trim_trailing_partial_start(result_text)
+
+        await self.reset()
+
+        stripped = result_text.strip()
+        if not stripped:
+            return None
+        agg_type = TextType.TOKEN if self._aggregation_type == TextType.TOKEN else TextType.SENTENCE
+        return PatternMatch(content=stripped, type=agg_type, full_match=result_text)
+
+    def _find_earliest_droppable_start(self, text: str) -> int | None:
+        """Find the earliest unmatched start delimiter that flush() should cut at.
+
+        Only REMOVE/AGGREGATE patterns' unmatched starts are candidates: KEEP
+        patterns are excluded because unclosed KEEP content is kept, not cut.
+
+        Args:
+            text: The buffered text to scan.
+
+        Returns:
+            The index of the earliest droppable unmatched start delimiter,
+            or None if there isn't one.
+        """
+        earliest = None
+
+        for pattern_info in self._patterns.values():
+            if pattern_info.get("action", MatchAction.REMOVE) == MatchAction.KEEP:
+                continue
+
+            index = self._unmatched_start(text, pattern_info["start"], pattern_info["end"])
+            if index is not None and (earliest is None or index < earliest):
+                earliest = index
+
+        return earliest
+
+    def _trim_trailing_partial_start(self, text: str) -> str:
+        """Trim a trailing partial REMOVE/AGGREGATE start delimiter, if any.
+
+        The stream can end mid-delimiter (e.g. buffered text ending in
+        ``<te`` of ``<test>``). That partial text isn't a complete start
+        delimiter, so :meth:`_find_earliest_droppable_start` won't catch it,
+        but it also isn't safe to speak. KEEP patterns are excluded since a
+        KEEP delimiter is kept whether or not it's complete.
+
+        Args:
+            text: The text to check for a trailing partial delimiter.
+
+        Returns:
+            The text with a trailing partial start delimiter removed, or the
+            original text if there isn't one.
+        """
+        max_trim = 0
+
+        for pattern_info in self._patterns.values():
+            if pattern_info.get("action", MatchAction.REMOVE) == MatchAction.KEEP:
+                continue
+
+            start = pattern_info["start"]
+            for length in range(min(len(start) - 1, len(text)), 0, -1):
+                if text.endswith(start[:length]):
+                    max_trim = max(max_trim, length)
+                    break
+
+        return text[:-max_trim] if max_trim else text
 
     async def handle_interruption(self):
         """Handle interruptions by clearing the buffer and pattern state.

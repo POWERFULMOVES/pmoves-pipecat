@@ -23,21 +23,23 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
-    StartFrame,
     TranscriptionFrame,
 )
+from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.services.azure.common import language_to_azure_language
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import AZURE_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 try:
     from azure.cognitiveservices.speech import (
         CancellationReason,
         ProfanityOption,
+        PropertyId,
         ResultReason,
         SpeechConfig,
         SpeechRecognizer,
@@ -67,6 +69,14 @@ _PROFANITY_OPTIONS: dict[AzureProfanity, ProfanityOption] = {
     "removed": ProfanityOption.Removed,
 }
 
+AzurePostProcessing = Literal["TrueText", "PostRefinement"]
+"""Post-processing Azure applies to recognition results before returning them.
+
+* ``"TrueText"`` — display formatting (punctuation, capitalization).
+* ``"PostRefinement"`` — post-stream refinement: a more accurate final result
+  built from broader audio context, leaving interim results untouched.
+"""
+
 
 @dataclass
 class AzureSTTSettings(STTSettings):
@@ -84,9 +94,32 @@ class AzureSTTSettings(STTSettings):
             containing common substrings), which breaks downstream fuzzy
             matching and LLM reasoning. See `SpeechConfig.set_profanity
             <https://learn.microsoft.com/en-us/python/api/azure-cognitiveservices-speech/azure.cognitiveservices.speech.speechconfig#azure-cognitiveservices-speech-speechconfig-set-profanity>`_.
+        segmentation_silence_timeout_ms: How much silence Azure allows inside a
+            phrase, in milliseconds, before it finalizes the recognition and
+            emits a ``TranscriptionFrame``. Azure accepts 100–5000; its default
+            is 500. Store-mode default is ``None`` (keep Azure's default).
+            Lower values finalize sooner, at the cost of splitting phrases that
+            contain pauses; higher values keep slow or hesitant speech in one
+            transcript. See `phrase segmentation
+            <https://learn.microsoft.com/en-us/azure/ai-services/speech-service/how-to-recognize-speech#change-how-silence-is-handled>`_.
+        post_processing_option: Post-processing Azure applies before returning
+            results, either ``"TrueText"`` or ``"PostRefinement"`` (see
+            ``AzurePostProcessing``); only one applies at a time. Store-mode
+            default is ``None`` (keep Azure's default). ``"PostRefinement"``
+            replaces each segment's final result with a more accurate one built
+            from broader audio context, leaving interim results untouched; Azure
+            notes very short phrases often come back unchanged. See
+            `post-processing
+            <https://learn.microsoft.com/en-us/azure/ai-services/speech-service/how-to-post-processing>`_.
     """
 
-    profanity: AzureProfanity | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    profanity: AzureProfanity | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    segmentation_silence_timeout_ms: int | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
+    post_processing_option: AzurePostProcessing | None | NotGiven = field(
+        default_factory=lambda: NOT_GIVEN
+    )
 
 
 class AzureSTTService(STTService):
@@ -140,6 +173,8 @@ class AzureSTTService(STTService):
             model=None,
             language=Language.EN_US,
             profanity=None,
+            segmentation_silence_timeout_ms=None,
+            post_processing_option=None,
         )
 
         # 2. Apply direct init arg overrides (deprecated)
@@ -188,6 +223,8 @@ class AzureSTTService(STTService):
             self._speech_config.endpoint_id = endpoint_id
 
         self._apply_profanity()
+        self._apply_segmentation_silence_timeout()
+        self._apply_post_processing_option()
 
         self._audio_stream = None
         self._speech_recognizer = None
@@ -224,8 +261,30 @@ class AzureSTTService(STTService):
         if profanity is not None:
             self._speech_config.set_profanity(_PROFANITY_OPTIONS[profanity])
 
+    def _apply_segmentation_silence_timeout(self):
+        """Apply the current ``segmentation_silence_timeout_ms`` setting.
+
+        A no-op when the setting is ``None`` (keeps Azure's default of 500 ms).
+        """
+        timeout_ms = assert_given(self._settings.segmentation_silence_timeout_ms)
+        if timeout_ms is not None:
+            self._speech_config.set_property(
+                PropertyId.Speech_SegmentationSilenceTimeoutMs, str(timeout_ms)
+            )
+
+    def _apply_post_processing_option(self):
+        """Apply the current ``post_processing_option`` setting.
+
+        A no-op when the setting is ``None`` (keeps Azure's default).
+        """
+        option = assert_given(self._settings.post_processing_option)
+        if option is not None:
+            self._speech_config.set_property(
+                PropertyId.SpeechServiceResponse_PostProcessingOption, option
+            )
+
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Apply a settings delta and reconnect if language or profanity changed."""
+        """Apply a settings delta and reconnect if a recognizer setting changed."""
         changed = await super()._update_settings(delta)
 
         if "language" in changed:
@@ -236,9 +295,24 @@ class AzureSTTService(STTService):
         if "profanity" in changed:
             self._apply_profanity()
 
-        # Both settings are baked into the recognizer at connect time, so a
+        if "segmentation_silence_timeout_ms" in changed:
+            self._apply_segmentation_silence_timeout()
+
+        if "post_processing_option" in changed:
+            self._apply_post_processing_option()
+
+        # These settings are baked into the recognizer at connect time, so a
         # live change only takes effect after a reconnect.
-        if ("language" in changed or "profanity" in changed) and self._audio_stream:
+        if (
+            changed.keys()
+            & {
+                "language",
+                "profanity",
+                "segmentation_silence_timeout_ms",
+                "post_processing_option",
+            }
+            and self._audio_stream
+        ):
             await self._disconnect()
             await self._connect()
 
@@ -257,21 +331,25 @@ class AzureSTTService(STTService):
             Frame: Either None for successful processing or ErrorFrame on failure.
         """
         try:
-            await self.start_processing_metrics()
             if self._audio_stream:
                 self._audio_stream.write(audio)
             yield None
         except Exception as e:
             yield ErrorFrame(error=f"Unknown error occurred: {e}")
 
-    async def start(self, frame: StartFrame):
-        """Start the speech recognition service.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
 
         Args:
-            frame: Frame indicating the start of processing.
+            setup: Configuration object containing setup parameters.
         """
-        await super().start(frame)
+        await super().setup(setup)
         await self._connect()
+
+    async def cleanup(self):
+        """Release resources at pipeline teardown."""
+        await super().cleanup()
+        await self._disconnect()
 
     async def stop(self, frame: EndFrame):
         """Stop the speech recognition service.
@@ -289,11 +367,6 @@ class AzureSTTService(STTService):
             frame: Frame indicating cancellation.
         """
         await super().cancel(frame)
-        await self._disconnect()
-
-    async def cleanup(self):
-        """Release resources at pipeline teardown."""
-        await super().cleanup()
         await self._disconnect()
 
     async def _connect(self):
@@ -334,7 +407,7 @@ class AzureSTTService(STTService):
         self, transcript: str, is_final: bool, language: Language | None = None
     ):
         """Handle a transcription result with tracing."""
-        await self.stop_processing_metrics()
+        pass
 
     def _on_handle_recognized(self, event):
         if event.result.reason == ResultReason.RecognizedSpeech and len(event.result.text) > 0:

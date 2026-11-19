@@ -7,21 +7,11 @@
 import asyncio
 import time
 import unittest
-import warnings
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
-
-# The create_vad_analyzer factory and AICVADAnalyzer constructor now emit
-# DeprecationWarnings of their own (covered by their dedicated test files).
-# Suppress here so this file's primary coverage stays quiet.
-warnings.filterwarnings(
-    "ignore",
-    category=DeprecationWarning,
-    message=".*(AICVADAnalyzer|create_vad_analyzer) is deprecated.*",
-)
 
 # Check if aic_sdk is available
 aic_sdk: Any
@@ -232,7 +222,6 @@ class TestAICFilter(unittest.IsolatedAsyncioTestCase):
             mock_config_cls.optimal.assert_called_once()
             mock_processor_cls.assert_called_once()
             self.assertIsNotNone(filter_instance._processor_ctx)
-            self.assertIsNotNone(filter_instance._vad_ctx)
 
     async def test_start_applies_initial_bypass_parameter(self):
         """Test that start applies bypass parameter."""
@@ -301,10 +290,9 @@ class TestAICFilter(unittest.IsolatedAsyncioTestCase):
             await filter_instance.stop()
 
         mock_release.assert_called_once_with(cache_key)
-        self.assertTrue(self.mock_processor.processor_ctx.reset_called)
+        self.assertTrue(self.mock_processor.terminated)
         self.assertIsNone(filter_instance._processor)
         self.assertIsNone(filter_instance._processor_ctx)
-        self.assertIsNone(filter_instance._vad_ctx)
         self.assertIsNone(filter_instance._model)
         self.assertIsNone(filter_instance._model_cache_key)
         self.assertFalse(filter_instance._aic_ready)
@@ -601,47 +589,16 @@ class TestAICFilter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(output_audio), 320)  # 1 frame
         self.assertEqual(len(filter_instance._audio_buffer), 180)  # 90 samples * 2 bytes
 
-    async def test_get_vad_context_before_start(self):
-        """Test that get_vad_context raises before start."""
-        filter_instance = self._create_filter_with_mocks()
-
-        with self.assertRaises(RuntimeError) as context:
-            filter_instance.get_vad_context()
-
-        self.assertIn("not initialized", str(context.exception))
-
-    async def test_get_vad_context_after_start(self):
-        """Test that get_vad_context returns context after start."""
+    async def test_filter_passes_audio_through_after_stop(self):
+        """Test a late chunk after stop is passed through instead of erroring."""
         filter_instance = self._create_filter_with_mocks()
         await self._start_filter_with_mocks(filter_instance)
+        await filter_instance.stop()
 
-        vad_ctx = filter_instance.get_vad_context()
+        samples = np.random.randint(-32768, 32767, size=160, dtype=np.int16)
+        input_audio = samples.tobytes()
 
-        self.assertEqual(vad_ctx, self.mock_processor.vad_ctx)
-
-    async def test_create_vad_analyzer(self):
-        """Test create_vad_analyzer returns analyzer with factory."""
-        filter_instance = self._create_filter_with_mocks()
-
-        analyzer = filter_instance.create_vad_analyzer()
-
-        self.assertIsNotNone(analyzer)
-        # Factory should be set
-        self.assertIsNotNone(analyzer._vad_context_factory)
-
-    async def test_create_vad_analyzer_with_params(self):
-        """Test create_vad_analyzer with custom parameters."""
-        filter_instance = self._create_filter_with_mocks()
-
-        analyzer = filter_instance.create_vad_analyzer(
-            speech_hold_duration=0.1,
-            minimum_speech_duration=0.05,
-            sensitivity=8.0,
-        )
-
-        self.assertEqual(analyzer._pending_speech_hold_duration, 0.1)
-        self.assertEqual(analyzer._pending_minimum_speech_duration, 0.05)
-        self.assertEqual(analyzer._pending_sensitivity, 8.0)
+        self.assertEqual(await filter_instance.filter(input_audio), input_audio)
 
     async def test_multiple_start_stop_cycles(self):
         """Test multiple start/stop cycles."""
@@ -792,6 +749,53 @@ class TestAICFilter(unittest.IsolatedAsyncioTestCase):
             await filter_instance.process_frame(self.FilterEnableFrame(enable=True))
         # Filter state still updated to reflect the requested enable.
         self.assertFalse(filter_instance._bypass)
+
+    async def test_tap_receives_blocks_before_enhancement(self):
+        """The tap gets each normalized block and the sample rate before process_async."""
+        filter_instance = self._create_filter_with_mocks()
+
+        async def enhancing_process_async(audio_array):
+            return audio_array * 0.5
+
+        self.mock_processor.process_async = enhancing_process_async
+        calls = []
+        filter_instance.set_pre_process_tap(lambda block, rate: calls.append((block.copy(), rate)))
+        await self._start_filter_with_mocks(filter_instance)
+
+        samples = np.random.randint(-32768, 32767, size=320, dtype=np.int16)
+        await filter_instance.filter(samples.tobytes())
+
+        self.assertEqual([rate for _, rate in calls], [16000, 16000])
+        expected = samples.astype(np.float32) / 32768.0
+        np.testing.assert_allclose(np.concatenate([block for block, _ in calls]), expected)
+
+    async def test_tap_removed_with_none(self):
+        """Setting the tap to None stops the calls."""
+        filter_instance = self._create_filter_with_mocks()
+        calls = []
+        filter_instance.set_pre_process_tap(lambda block, rate: calls.append(rate))
+        await self._start_filter_with_mocks(filter_instance)
+
+        filter_instance.set_pre_process_tap(None)
+        samples = np.random.randint(-32768, 32767, size=160, dtype=np.int16)
+        await filter_instance.filter(samples.tobytes())
+
+        self.assertEqual(calls, [])
+
+    async def test_tap_kept_across_stop_and_start(self):
+        """stop() keeps the tap, because the caller that sets it also removes it."""
+        filter_instance = self._create_filter_with_mocks()
+        calls = []
+        filter_instance.set_pre_process_tap(lambda block, rate: calls.append(rate))
+        await self._start_filter_with_mocks(filter_instance)
+        await filter_instance.stop()
+
+        self.mock_processor = MockProcessor()
+        await self._start_filter_with_mocks(filter_instance)
+        samples = np.random.randint(-32768, 32767, size=160, dtype=np.int16)
+        await filter_instance.filter(samples.tobytes())
+
+        self.assertEqual(calls, [16000])
 
 
 if __name__ == "__main__":

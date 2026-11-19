@@ -10,14 +10,14 @@ This example demonstrates a conversational bot with:
 - Krisp VIVA noise reduction on incoming audio
 - Krisp VIVA Turn detection for end-of-turn
 - Krisp Interruption Prediction (IP) to filter backchannels from real interruptions
-- Voice activity detection (VAD)
+- Krisp VIVA voice activity detection (VAD), which also drives IP
 
 Required environment variables:
 - KRISP_VIVA_FILTER_MODEL_PATH: Path to the Krisp noise filter model file (.kef)
 - KRISP_VIVA_TURN_MODEL_PATH: Path to the Krisp turn detection model file (.kef)
 - KRISP_VIVA_IP_MODEL_PATH: Path to the Krisp IP model file (.kef)
-- DEEPGRAM_API_KEY: Deepgram API key for STT
-- CARTESIA_API_KEY: Cartesia API key for TTS
+- KRISP_VIVA_VAD_MODEL_PATH: Path to the Krisp VAD model file (.kef)
+- DEEPGRAM_API_KEY: Deepgram API key for STT and TTS
 - OPENAI_API_KEY: OpenAI API key for LLM
 
 Optional environment variables:
@@ -33,13 +33,13 @@ from loguru import logger
 
 from pipecat.audio.filters.krisp_viva_filter import KrispVivaFilter
 from pipecat.audio.turn.krisp_viva_turn import KrispVivaTurn
-from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.krisp_viva_vad import KrispVivaVadAnalyzer
 from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.metrics.metrics import TurnMetricsData
 from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -47,16 +47,14 @@ from pipecat.processors.aggregators.llm_response_universal import (
 )
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+from pipecat.transports.livekit.transport import LiveKitParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
-from pipecat.turns.user_start import (
-    KrispVivaIPUserTurnStartStrategy,
-    TranscriptionUserTurnStartStrategy,
-)
+from pipecat.turns.user_start import KrispVivaIPUserTurnStartStrategy
 from pipecat.turns.user_stop import TurnAnalyzerUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
@@ -70,6 +68,11 @@ transport_params = {
         audio_in_filter=KrispVivaFilter(),
     ),
     "daily": lambda: DailyParams(
+        audio_in_enabled=True,
+        audio_out_enabled=True,
+        audio_in_filter=KrispVivaFilter(),
+    ),
+    "livekit": lambda: LiveKitParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
         audio_in_filter=KrispVivaFilter(),
@@ -88,15 +91,12 @@ transport_params = {
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info(f"Starting bot")
+    logger.info("Starting bot")
 
     stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
 
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        settings=CartesiaTTSService.Settings(
-            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-        ),
+    tts = DeepgramTTSService(
+        api_key=os.environ["DEEPGRAM_API_KEY"],
     )
 
     llm = OpenAILLMService(
@@ -111,13 +111,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context,
         user_params=LLMUserAggregatorParams(
             user_turn_strategies=UserTurnStrategies(
-                start=[
-                    KrispVivaIPUserTurnStartStrategy(threshold=0.5),
-                    TranscriptionUserTurnStartStrategy(),
-                ],
+                start=[KrispVivaIPUserTurnStartStrategy(threshold=0.5)],
                 stop=[TurnAnalyzerUserTurnStopStrategy(turn_analyzer=KrispVivaTurn())],
             ),
-            vad_analyzer=SileroVADAnalyzer(),  # or KrispVivaVadAnalyzer
+            vad_analyzer=KrispVivaVadAnalyzer(),
         ),
     )
 
@@ -141,11 +138,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         ),
         idle_timeout_secs=runner_args.pipeline_idle_timeout_secs,
         observers=[MetricsLogObserver(include_metrics={TurnMetricsData})],
+        processor_unusable_policy=ProcessorUnusablePolicy.END,
     )
+
+    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
+
+    await runner.add_workers(worker)
 
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
+        logger.info("Client connected")
         # Kick off the conversation.
         context.add_message(
             {"role": "developer", "content": "Please introduce yourself to the user."}
@@ -154,12 +156,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
-        await worker.cancel()
+        logger.info("Client disconnected")
+        await runner.cancel()
 
-    runner = WorkerRunner(handle_sigint=runner_args.handle_sigint)
-
-    await runner.add_workers(worker)
     await runner.run()
 
 

@@ -20,8 +20,8 @@ from typing import Any
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from pipecat.adapters.base_llm_adapter import LLMContextConversionError
-from pipecat.adapters.services.bedrock_adapter import (
+from pipecat.adapters.llm.base_llm_adapter import LLMContextConversionError
+from pipecat.adapters.llm.services.bedrock_adapter import (
     AWSBedrockLLMAdapter,
     AWSBedrockLLMInvocationParams,
 )
@@ -32,20 +32,30 @@ from pipecat.frames.frames import (
     LLMEnablePromptCachingFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMThoughtEndFrame,
+    LLMThoughtStartFrame,
+    LLMThoughtTextFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.aws.utils import resolve_credentials
 from pipecat.services.llm_service import LLMService
-from pipecat.services.settings import NOT_GIVEN, LLMSettings, _NotGiven, assert_given
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.deprecation import deprecated
+from pipecat.utils.errors import ErrorCategory
+from pipecat.utils.text.tagged_llm_text_parser import (
+    TaggedLLMTextParsedOutputChunk,
+    TaggedLLMTextParsedOutputChunkKind,
+    TaggedLLMTextParser,
+)
 from pipecat.utils.tracing.service_decorators import traced_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 try:
     import aiobotocore.session
     from botocore.config import Config
-    from botocore.exceptions import ReadTimeoutError
+    from botocore.exceptions import ClientError, ReadTimeoutError
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error(
@@ -61,6 +71,11 @@ class AWSBedrockLLMSettings(LLMSettings):
     Parameters:
         stop_sequences: List of strings that stop generation.
         latency: Performance mode - "standard" or "optimized".
+        effort: How much reasoning the model spends before answering — "low",
+            "medium", "high", "xhigh" or "max". Sent as Converse's
+            ``outputConfig.effort``; only reasoning models accept it, and a model
+            that does not support it rejects the request. See:
+            https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_OutputConfig.html
         enable_prompt_caching: Whether to enable prompt caching by adding cachePoint
             markers to system prompts and tool definitions. Can reduce TTFT by up to
             85% for multi-turn conversations. See:
@@ -68,10 +83,11 @@ class AWSBedrockLLMSettings(LLMSettings):
         additional_model_request_fields: Additional model-specific parameters.
     """
 
-    stop_sequences: list[str] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    latency: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_prompt_caching: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    additional_model_request_fields: dict[str, Any] | _NotGiven = field(
+    stop_sequences: list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    latency: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    effort: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_prompt_caching: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    additional_model_request_fields: dict[str, Any] | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -185,6 +201,7 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             user_turn_completion_config=None,
             stop_sequences=None,
             latency=None,
+            effort=None,
             enable_prompt_caching=False,
             additional_model_request_fields={},
         )
@@ -228,7 +245,8 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
 
         self._aws_session = aiobotocore.session.get_session()
 
-        # Resolve credentials using the shared chain (explicit → env → botocore).
+        # Explicit or environment keys. Without them, each client takes its
+        # credentials from the session's default chain, which renews them.
         resolved = resolve_credentials(
             aws_access_key_id=aws_access_key,
             aws_secret_access_key=aws_secret_key,
@@ -277,6 +295,7 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
         context: LLMContext,
         max_tokens: int | None = None,
         system_instruction: str | None = None,
+        response_schema: dict[str, Any] | None = None,
     ) -> str | None:
         """Run a one-shot, out-of-band (i.e. out-of-pipeline) inference with the given LLM context.
 
@@ -286,17 +305,20 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                 overrides the service's default max_tokens setting.
             system_instruction: Optional system instruction to use for this inference.
                 If provided, overrides any system instruction in the context.
+            response_schema: Accepted for interface compatibility. Bedrock's
+                Converse API has no reply schema, so it is not enforced.
 
         Returns:
             The LLM's response as a string, or None if no response is generated.
         """
+        self._check_response_schema(response_schema)
         messages = []
         system = []
         effective_instruction = system_instruction or assert_given(
             self._settings.system_instruction
         )
         adapter = self.get_llm_adapter()
-        params = adapter.get_llm_invocation_params(
+        params = await adapter.get_llm_invocation_params(
             context,
             system_instruction=effective_instruction,
             ensure_last_message_is_user=self._should_inject_trailing_user_message(),
@@ -319,6 +341,9 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
 
         if inference_config:
             request_params["inferenceConfig"] = inference_config
+
+        if self._settings.effort:
+            request_params["outputConfig"] = {"effort": self._settings.effort}
 
         if system:
             request_params["system"] = system
@@ -363,7 +388,7 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                     client.converse_stream(**request_params), timeout=self._retry_timeout_secs
                 )
                 return response
-            except (TimeoutError, ReadTimeoutError) as e:
+            except (TimeoutError, ReadTimeoutError):
                 # Retry, this time without a timeout so we get a response
                 logger.debug(f"{self}: Retrying converse_stream due to timeout")
                 response = await client.converse_stream(**request_params)
@@ -421,9 +446,11 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             return False
         return not any(p in model for p in self._PREFILL_SUPPORTED_PATTERNS)
 
-    def _get_llm_invocation_params(self, context: LLMContext) -> AWSBedrockLLMInvocationParams:
+    async def _get_llm_invocation_params(
+        self, context: LLMContext
+    ) -> AWSBedrockLLMInvocationParams:
         adapter = self.get_llm_adapter()
-        params = adapter.get_llm_invocation_params(
+        params = await adapter.get_llm_invocation_params(
             context,
             system_instruction=assert_given(self._settings.system_instruction),
             ensure_last_message_is_user=self._should_inject_trailing_user_message(),
@@ -441,6 +468,14 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
         use_completion_tokens_estimate = False
 
         using_noop_tool = False
+        # Amazon Nova (v1) models write their reasoning into a text block,
+        # wrapped in <thinking> tags, ahead of a tool call. A response can hold
+        # several such blocks, so each text block is parsed on its own.
+        thinking_parser = TaggedLLMTextParser("<thinking>", "</thinking>")
+        text_index: int | None = None
+        # The content block of the reasoning in progress, and its signature.
+        reasoning_index: int | None = None
+        reasoning_signature: str | None = None
 
         try:
             await self.push_frame(LLMFullResponseStartFrame())
@@ -448,7 +483,7 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
 
             await self.start_ttfb_metrics()
 
-            params_from_context = self._get_llm_invocation_params(context)
+            params_from_context = await self._get_llm_invocation_params(context)
             messages = params_from_context["messages"]
             system = params_from_context["system"]
             tools = params_from_context["tools"]
@@ -509,6 +544,9 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             if self._settings.latency in ["standard", "optimized"]:
                 request_params["performanceConfig"] = {"latency": self._settings.latency}
 
+            if self._settings.effort:
+                request_params["outputConfig"] = {"effort": self._settings.effort}
+
             # Add cache checkpoints to system prompts and tool definitions.
             # This enables prompt caching for providers that support it (e.g.
             # Anthropic Claude on Bedrock), reducing TTFT by up to 85% on
@@ -527,18 +565,13 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                     if not any("cachePoint" in t for t in tools_list):
                         tools_list.append({"cachePoint": {"type": "default"}})
 
-            # Log request params with messages redacted for logging
-            adapter = self.get_llm_adapter()
-            messages_for_logging = adapter.get_messages_for_logging(context)
-            logger.debug(f"{self}: Generating chat from context {messages_for_logging}")
+            self._log_llm_response(context)
 
             async with self._aws_session.create_client(
                 service_name="bedrock-runtime", **self._aws_params
             ) as client:
                 # Call AWS Bedrock with streaming
                 response = await self._create_converse_stream(client, request_params)
-
-                await self.stop_ttfb_metrics()
 
                 # Process the streaming response. Bedrock emits each tool call as
                 # its own content block, identified by contentBlockIndex, so we key
@@ -550,12 +583,20 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                 function_calls = []
 
                 async for event in response["stream"]:
+                    # The events that open the stream (messageStart) carry no
+                    # model output, so TTFB ends at the first content block.
+                    if "contentBlockStart" in event or "contentBlockDelta" in event:
+                        await self.stop_ttfb_metrics()
+
                     # Handle text content
                     if "contentBlockDelta" in event:
                         block = event["contentBlockDelta"]
                         delta = block["delta"]
                         if "text" in delta:
-                            await self._push_llm_text(delta["text"])
+                            text_index = block["contentBlockIndex"]
+                            await self._push_thinking_chunks(
+                                thinking_parser.parse_next_chunk(delta["text"])
+                            )
                             completion_tokens_estimate += self._estimate_tokens(delta["text"])
                         elif "toolUse" in delta and "input" in delta["toolUse"]:
                             # Handle partial JSON for tool use
@@ -566,12 +607,35 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                             completion_tokens_estimate += self._estimate_tokens(
                                 delta["toolUse"]["input"]
                             )
+                        elif "reasoningContent" in delta:
+                            reasoning = delta["reasoningContent"]
+                            if reasoning_index is None and (
+                                "text" in reasoning or "signature" in reasoning
+                            ):
+                                reasoning_index = block["contentBlockIndex"]
+                                await self.push_frame(
+                                    LLMThoughtStartFrame(
+                                        append_to_context=True,
+                                        llm=self.get_llm_adapter().id_for_llm_specific_messages,
+                                    )
+                                )
+                            if "text" in reasoning:
+                                await self.push_frame(LLMThoughtTextFrame(reasoning["text"]))
+                                completion_tokens_estimate += self._estimate_tokens(
+                                    reasoning["text"]
+                                )
+                            elif "signature" in reasoning:
+                                reasoning_signature = reasoning["signature"]
 
                     # Handle tool use start
                     elif "contentBlockStart" in event:
                         block = event["contentBlockStart"]
                         content_block_start = block["start"]
                         if "toolUse" in content_block_start:
+                            # A turn that only calls tools produces no answer text,
+                            # so the call itself is what the caller gets and TTFAT
+                            # ends here rather than going unmeasured.
+                            await self.stop_ttfat_metrics()
                             index = block["contentBlockIndex"]
                             tool_use_blocks[index] = {
                                 "id": content_block_start["toolUse"].get("toolUseId", ""),
@@ -582,6 +646,13 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                     # Handle tool use completion
                     elif "contentBlockStop" in event:
                         index = event["contentBlockStop"]["contentBlockIndex"]
+                        if index == text_index:
+                            await self._push_thinking_chunks(thinking_parser.flush())
+                            text_index = None
+                        if index == reasoning_index:
+                            await self.push_frame(LLMThoughtEndFrame(signature=reasoning_signature))
+                            reasoning_index = None
+                            reasoning_signature = None
                         tool_use_block = tool_use_blocks.pop(index, None)
                         if tool_use_block:
                             json_accumulator = json_accumulators.pop(index, "")
@@ -611,6 +682,8 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
                         cache_read_input_tokens += usage.get("cacheReadInputTokens", 0)
                         cache_creation_input_tokens += usage.get("cacheWriteInputTokens", 0)
 
+                await self._push_thinking_chunks(thinking_parser.flush())
+
             await self.run_function_calls(function_calls)
         except asyncio.CancelledError:
             # If we're interrupted, we won't get a complete usage report. So set our flag to use the
@@ -622,9 +695,45 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
             await self._call_event_handler("on_completion_timeout")
         except LLMContextConversionError as e:
             await self.push_error(error_msg=str(e), exception=e)
+            # A conversion failure (e.g. an unsupported file MIME type, corrupt
+            # base64 data) can't reach the API at all, but is just as much
+            # evidence of an invalid file as a rejection from Bedrock itself, so
+            # it gets the same best-effort cleanup.
+            context.remove_invalid_file_message()
+        except ClientError as e:
+            # botocore uses a single exception class for the whole 4xx/5xx
+            # range, so check the error code directly rather than the status
+            # code: ValidationException (bad document name, unsupported
+            # format, etc.) is grounds to remove a pending file message on a
+            # best-effort basis, but AccessDeniedException, ThrottlingException,
+            # and the rest say nothing about whether our request (or its
+            # file) was bad, and removing the file there would discard it
+            # for no benefit. When a message is removed as a result of this
+            # error, the fault lay in application-supplied content and the
+            # context is repaired, so the error is pushed as APPLICATION
+            # instead of letting the rejection classify as permanent and cost
+            # the service its usability.
+            # Compared case-insensitively: an up-front request rejection
+            # reports ValidationException, but a rejection arriving mid-stream
+            # (an EventStreamError, e.g. the model refusing a file's content)
+            # reports the event stream's modeled code, validationException.
+            error_code = e.response.get("Error", {}).get("Code") or ""
+            removed = (
+                error_code.lower() == "validationexception"
+                and context.remove_invalid_file_message()
+            )
+            await self.push_error(
+                error_msg=f"Unknown error occurred: {e}",
+                exception=e,
+                category=ErrorCategory.APPLICATION if removed else None,
+            )
         except Exception as e:
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
+            # Closes a thought left open by an interrupted or failed stream.
+            await self._push_thinking_chunks(thinking_parser.reset())
+            if reasoning_index is not None:
+                await self.push_frame(LLMThoughtEndFrame())
             await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
             comp_tokens = (
@@ -658,6 +767,18 @@ class AWSBedrockLLMService(LLMService[AWSBedrockLLMAdapter]):
 
     def _estimate_tokens(self, text: str) -> int:
         return int(len(re.split(r"[^\w]+", text)) * 1.3)
+
+    async def _push_thinking_chunks(self, chunks: list[TaggedLLMTextParsedOutputChunk]):
+        """Push text as LLM text and leading ``<thinking>`` content as thoughts."""
+        for chunk in chunks:
+            if chunk.kind == TaggedLLMTextParsedOutputChunkKind.TEXT:
+                await self._push_llm_text(chunk.text)
+            elif chunk.kind == TaggedLLMTextParsedOutputChunkKind.THOUGHT_START:
+                await self.push_frame(LLMThoughtStartFrame())
+            elif chunk.kind == TaggedLLMTextParsedOutputChunkKind.THOUGHT_TEXT:
+                await self.push_frame(LLMThoughtTextFrame(chunk.text))
+            elif chunk.kind == TaggedLLMTextParsedOutputChunkKind.THOUGHT_END:
+                await self.push_frame(LLMThoughtEndFrame())
 
     async def _report_usage_metrics(
         self,

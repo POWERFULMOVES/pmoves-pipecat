@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from loguru import logger
 from pydantic import BaseModel
 
+from pipecat.adapters.tts.base_expression_adapter import BaseExpressionAdapter
+from pipecat.adapters.tts.services.azure_adapter import AzureHDExpressionAdapter
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -23,13 +25,14 @@ from pipecat.frames.frames import (
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
 from pipecat.services.azure.common import language_to_azure_language
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TextAggregationMode, TTSService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 try:
     from azure.cognitiveservices.speech import (
@@ -72,6 +75,11 @@ class AzureTTSSettings(TTSSettings):
     """Settings for AzureTTSService and AzureHttpTTSService.
 
     Parameters:
+        effect: Audio effect processor that compensates for playback distortion on
+            a target device, as SSML's ``effect`` attribute on ``<voice>``:
+            ``"eq_car"`` for enclosed vehicles, ``"eq_telecomhp8k"`` for narrowband
+            telephony (pair it with an 8 kHz pipeline, or the output is not
+            optimized). Azure ignores an unrecognized value.
         emphasis: Emphasis level for speech ("strong", "moderate", "reduced").
         force_locale: Wrap synthesized text in SSML's ``<lang xml:lang>`` so the
             voice speaks in the configured ``language`` rather than the one it
@@ -87,17 +95,24 @@ class AzureTTSSettings(TTSSettings):
         role: Voice role for expression (e.g., "YoungAdultFemale").
         style: Speaking style (e.g., "cheerful", "sad", "excited").
         style_degree: Intensity of the speaking style (0.01 to 2.0).
+        voice_parameters: Model parameters for HD voices, as SSML's
+            semicolon-separated ``parameters`` attribute on ``<voice>`` (e.g.
+            ``"temperature=0.7;top_p=0.8;top_k=22;cfg_scale=1.4"``, or
+            ``"enhancePronunciation=true"``). Which keys apply depends on the
+            voice's base model; standard neural voices ignore the attribute.
         volume: Volume level (e.g., "+20%", "loud", "x-soft").
     """
 
-    emphasis: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    force_locale: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    pitch: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    rate: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    role: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    style: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    style_degree: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    volume: str | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    effect: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    emphasis: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    force_locale: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    pitch: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    rate: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    role: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    style: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    style_degree: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    voice_parameters: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    volume: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class AzureBaseTTSService:
@@ -175,6 +190,17 @@ class AzureBaseTTSService:
         self._region = region
         self._private_endpoint = private_endpoint
         self._speech_synthesizer = None
+        self._hd_expression_adapter = AzureHDExpressionAdapter()
+
+    def _voice_expression_adapter(self) -> BaseExpressionAdapter | None:
+        """The adapter for the voice: style markers on DragonHD and DragonHD Omni voices.
+
+        DragonHD Flash voices each have styles of their own, so they perform none.
+        """
+        voice = self._settings.voice
+        if isinstance(voice, str) and ":DragonHD" in voice and ":DragonHDFlash" not in voice:
+            return self._hd_expression_adapter
+        return None
 
     def language_to_service_language(self, language: Language) -> str | None:
         """Convert a Language enum to Azure language format.
@@ -193,11 +219,17 @@ class AzureBaseTTSService:
         # Escape special characters
         escaped_text = self._escape_text(text)
 
+        voice_attrs = f"name='{self._settings.voice}'"
+        if self._settings.effect:
+            voice_attrs += f" effect='{self._settings.effect}'"
+        if self._settings.voice_parameters:
+            voice_attrs += f" parameters='{self._settings.voice_parameters}'"
+
         ssml = (
             f"<speak version='1.0' xml:lang='{language}' "
             "xmlns='http://www.w3.org/2001/10/synthesis' "
             "xmlns:mstts='http://www.w3.org/2001/mstts'>"
-            f"<voice name='{self._settings.voice}'>"
+            f"<voice {voice_attrs}>"
             "<mstts:silence type='Sentenceboundary' value='20ms' />"
         )
 
@@ -330,6 +362,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             model=None,
             voice="en-US-SaraNeural",
             language="en-US",
+            effect=None,
             emphasis=None,
             force_locale=False,
             pitch=None,
@@ -337,6 +370,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
             role=None,
             style=None,
             style_degree=None,
+            voice_parameters=None,
             volume=None,
         )
 
@@ -398,6 +432,16 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._last_word: str | None = None  # Track last word for punctuation merging
         self._last_timestamp: float | None = None  # Track last timestamp
         self._current_context_id: str | None = None  # Track current context_id for word timestamps
+        # An HD voice's style marker still being reported, across word boundaries.
+        self._style_marker: str | None = None
+
+    def get_expression_adapter(self) -> BaseExpressionAdapter:
+        """The adapter for the voice: style markers on HD voices, otherwise none.
+
+        Returns:
+            The expression adapter for the current voice.
+        """
+        return self._voice_expression_adapter() or super().get_expression_adapter()
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
@@ -407,17 +451,13 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         """
         return True
 
-    async def start(self, frame: StartFrame):
-        """Start the Azure TTS service and initialize speech synthesizer.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service.
 
         Args:
-            frame: Start frame containing initialization parameters.
+            setup: Configuration object containing setup parameters.
         """
-        await super().start(frame)
-
-        if self._speech_config:
-            return
-
+        await super().setup(setup)
         # Now self.sample_rate is properly initialized
         if self._private_endpoint:
             self._speech_config = SpeechConfig(
@@ -450,6 +490,14 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         self._speech_synthesizer.synthesis_completed.connect(self._handle_completed)
         self._speech_synthesizer.synthesis_canceled.connect(self._handle_canceled)
         self._speech_synthesizer.synthesis_word_boundary.connect(self._handle_word_boundary)
+
+    async def start(self, frame: StartFrame):
+        """Start the Azure TTS service and initialize speech synthesizer.
+
+        Args:
+            frame: Start frame containing initialization parameters.
+        """
+        await super().start(frame)
 
         # Start word processor task
         if not self._word_processor_task:
@@ -534,11 +582,46 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
         if not word:
             return
 
-        # Route to language-specific handler
-        if self._is_cjk_language():
-            self._handle_cjk_word_boundary(word, absolute_seconds)
-        else:
-            self._handle_non_cjk_word_boundary(word, absolute_seconds)
+        words = self._split_style_markers(word) if self._voice_expression_adapter() else [word]
+        for word in words:
+            # Route to language-specific handler
+            if self._is_cjk_language():
+                self._handle_cjk_word_boundary(word, absolute_seconds)
+            else:
+                self._handle_non_cjk_word_boundary(word, absolute_seconds)
+
+    def _split_style_markers(self, word: str) -> list[str]:
+        """Split an HD voice's style and sound markers out of a word boundary's text.
+
+        Azure reports a marker such as ``[slow]`` across boundaries and joined to
+        the words around it, as ``"["`` then ``"slow] A"``. Each marker is
+        reported as a word of its own, ``"[slow]"`` then ``"A"``, so a marker
+        unfinished at the end of one boundary carries over to the next.
+
+        Args:
+            word: The boundary's text.
+
+        Returns:
+            The boundary's words and markers, in order.
+        """
+        pieces = []
+        text = ""
+        for char in word:
+            if char == "[" and self._style_marker is None:
+                if text.strip():
+                    pieces.append(text.strip())
+                text = ""
+                self._style_marker = "["
+            elif self._style_marker is not None:
+                self._style_marker += char
+                if char == "]":
+                    pieces.append(self._style_marker)
+                    self._style_marker = None
+            else:
+                text += char
+        if text.strip():
+            pieces.append(text.strip())
+        return pieces
 
     def _emit_pending_word(self):
         """Emit the currently buffered word if one exists."""
@@ -781,6 +864,7 @@ class AzureTTSService(TTSService, AzureBaseTTSService):
                 self._current_sentence_base_offset = self._cumulative_audio_offset
                 self._current_sentence_duration = 0.0
                 self._current_sentence_max_word_offset = 0.0
+                self._style_marker = None
 
                 ssml = self._construct_ssml(text)
                 self._speech_synthesizer.speak_ssml_async(ssml)
@@ -878,6 +962,7 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
             model=None,
             voice="en-US-SaraNeural",
             language="en-US",
+            effect=None,
             emphasis=None,
             force_locale=False,
             pitch=None,
@@ -885,6 +970,7 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
             role=None,
             style=None,
             style_degree=None,
+            voice_parameters=None,
             volume=None,
         )
 
@@ -931,6 +1017,14 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
         self._speech_config = None
         self._speech_synthesizer = None
 
+    def get_expression_adapter(self) -> BaseExpressionAdapter:
+        """The adapter for the voice: style markers on HD voices, otherwise none.
+
+        Returns:
+            The expression adapter for the current voice.
+        """
+        return self._voice_expression_adapter() or super().get_expression_adapter()
+
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics.
 
@@ -939,16 +1033,13 @@ class AzureHttpTTSService(TTSService, AzureBaseTTSService):
         """
         return True
 
-    async def start(self, frame: StartFrame):
-        """Start the Azure HTTP TTS service and initialize speech synthesizer.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service.
 
         Args:
-            frame: Start frame containing initialization parameters.
+            setup: Configuration object containing setup parameters.
         """
-        await super().start(frame)
-
-        if self._speech_config:
-            return
+        await super().setup(setup)
 
         if self._private_endpoint:
             self._speech_config = SpeechConfig(

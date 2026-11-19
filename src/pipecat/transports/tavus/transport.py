@@ -16,6 +16,7 @@ import base64
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from enum import StrEnum
 from functools import partial
 from typing import Any
 
@@ -25,6 +26,13 @@ from loguru import logger
 from pydantic import BaseModel
 
 from pipecat.audio.utils import create_stream_resampler
+from pipecat.expressive.expression import (
+    EMPHASIS_DELIVERY,
+    FAST_DELIVERY,
+    SLOW_DELIVERY,
+    ExpressionDelivery,
+)
+from pipecat.expressive.policy import ExpressionPolicy
 from pipecat.frames.frames import (
     BotConnectedFrame,
     BotStoppedSpeakingFrame,
@@ -39,7 +47,9 @@ from pipecat.frames.frames import (
     OutputTransportMessageUrgentFrame,
     StartFrame,
     TTSStoppedFrame,
+    TTSTextFrame,
 )
+from pipecat.pipeline.capabilities import BotCapabilities
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BOT_VAD_STOP_FALLBACK_SECS, BaseOutputTransport
@@ -49,6 +59,8 @@ from pipecat.transports.daily.transport import (
     DailyParams,
     DailyTransportClient,
 )
+from pipecat.utils.asyncio.task_manager import BaseTaskManager
+from pipecat.utils.shared import acquires, releases
 
 
 class TavusApi:
@@ -137,6 +149,67 @@ class TavusApi:
             return response["persona_name"]
 
 
+class TavusEmotion(StrEnum):
+    """A facial emotion the Tavus replica can express."""
+
+    NEUTRAL = "neutral"
+    HAPPINESS = "happiness"
+    SADNESS = "sadness"
+    ANGER = "anger"
+    FEAR = "fear"
+    SURPRISE = "surprise"
+    DISGUST = "disgust"
+    CONTEMPT = "contempt"
+
+
+# The Tavus emotion each universal delivery converts to: Pipecat's core deliveries
+# (``CORE_DELIVERY``), and the plainest deliveries of each emotion the core leaves
+# out. Any other delivery, and the voice's baseline, converts to neutral.
+TAVUS_DELIVERY_EMOTIONS: dict[str, TavusEmotion] = {
+    ExpressionDelivery.CALM: TavusEmotion.NEUTRAL,
+    ExpressionDelivery.CURIOUS: TavusEmotion.NEUTRAL,
+    ExpressionDelivery.CONFIDENT: TavusEmotion.NEUTRAL,
+    ExpressionDelivery.WARM: TavusEmotion.HAPPINESS,
+    ExpressionDelivery.EXCITED: TavusEmotion.HAPPINESS,
+    ExpressionDelivery.GRATEFUL: TavusEmotion.HAPPINESS,
+    ExpressionDelivery.HAPPY: TavusEmotion.HAPPINESS,
+    ExpressionDelivery.SYMPATHETIC: TavusEmotion.SADNESS,
+    ExpressionDelivery.APOLOGETIC: TavusEmotion.SADNESS,
+    ExpressionDelivery.SAD: TavusEmotion.SADNESS,
+    ExpressionDelivery.SURPRISED: TavusEmotion.SURPRISE,
+    ExpressionDelivery.ANGRY: TavusEmotion.ANGER,
+    ExpressionDelivery.FEARFUL: TavusEmotion.FEAR,
+    ExpressionDelivery.SCARED: TavusEmotion.FEAR,
+    ExpressionDelivery.DISGUSTED: TavusEmotion.DISGUST,
+    ExpressionDelivery.CONTEMPTUOUS: TavusEmotion.CONTEMPT,
+}
+
+
+def tavus_policy_warning(policy: ExpressionPolicy | None) -> str | None:
+    """Tell which of an expression policy's deliveries the replica has no emotion for.
+
+    The replica shows neutral when the bot speaks in one of them.
+
+    Args:
+        policy: The pipeline's expression policy, or None for the default.
+
+    Returns:
+        The warning, or None when the replica has an emotion for every delivery
+        the policy offers, as it has for the core ones offered without a list.
+        Slow and fast set the pace, not an emotion, so they're never named.
+    """
+    if policy is None or policy.delivery is None:
+        return None
+    handled = {*TAVUS_DELIVERY_EMOTIONS, SLOW_DELIVERY, FAST_DELIVERY}
+    unmapped = [name for name in policy.delivery if name not in handled]
+    if not unmapped:
+        return None
+    return (
+        f"the Tavus replica has no emotion for {', '.join(unmapped)} from the expression "
+        "policy, so it shows neutral when the bot speaks in them"
+    )
+
+
 class TavusCallbacks(BaseModel):
     """Callback handlers for Tavus events.
 
@@ -187,7 +260,7 @@ class TavusTransportClient:
         self,
         *,
         bot_name: str,
-        params: TavusParams = TavusParams(),
+        params: TavusParams | None = None,
         callbacks: TavusCallbacks,
         api_key: str,
         replica_id: str,
@@ -208,6 +281,7 @@ class TavusTransportClient:
                 `conversation.echo` app message API.
             session: The aiohttp session for making async HTTP requests.
         """
+        params = params or TavusParams()
         self._bot_name = bot_name
         self._api = TavusApi(api_key, session)
         self._replica_id = replica_id
@@ -216,13 +290,15 @@ class TavusTransportClient:
         self._client: DailyTransportClient | None = None
         self._callbacks = callbacks
         self._params = params
-        self._task_manager = None
-        self._resampler = create_stream_resampler()
+        self._task_manager: BaseTaskManager | None = None
+        self._resampler = create_stream_resampler(clear_after_secs=None)
         self._audio_queue: asyncio.Queue | None = None
         self._send_task = None
         # Utterance tracking for the realtime-paced send path (see
         # send_realtime_audio_frame/end_realtime_utterance/reset_realtime_utterance).
         self._realtime_inference_id: str | None = None
+        # The emotion last sent to the replica (see update_emotion).
+        self._emotion: TavusEmotion | None = None
 
     async def _initialize(self) -> str:
         """Initialize the conversation and return the room URL."""
@@ -230,6 +306,7 @@ class TavusTransportClient:
         self._conversation_id = response["conversation_id"]
         return response["conversation_url"]
 
+    @acquires("client")
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the client and initialize the conversation.
 
@@ -237,9 +314,6 @@ class TavusTransportClient:
             setup: The frame processor setup configuration.
         """
         self._task_manager = setup.task_manager
-        if self._conversation_id is not None:
-            logger.debug(f"Conversation ID already defined: {self._conversation_id}")
-            return
         try:
             room_url = await self._initialize()
             daily_callbacks = DailyCallbacks(
@@ -265,6 +339,9 @@ class TavusTransportClient:
                 on_dialout_error=partial(self._on_handle_callback, "on_dialout_error"),
                 on_dialout_warning=partial(self._on_handle_callback, "on_dialout_warning"),
                 on_dtmf_event=partial(self._on_handle_callback, "on_dtmf_event"),
+                on_network_connection_status_updated=partial(
+                    self._on_handle_callback, "on_network_connection_status_updated"
+                ),
                 on_participant_joined=self._callbacks.on_participant_joined,
                 on_participant_left=self._callbacks.on_participant_left,
                 on_participant_updated=partial(self._on_handle_callback, "on_participant_updated"),
@@ -280,17 +357,20 @@ class TavusTransportClient:
                 on_transcription_error=partial(self._on_handle_callback, "on_transcription_error"),
             )
             self._client = DailyTransportClient(
-                room_url, None, "Pipecat", self._params, daily_callbacks, self._bot_name
+                room_url, None, self._bot_name, self._params, daily_callbacks, "TavusPipecat"
             )
             await self._client.setup(setup)
         except Exception as e:
             logger.error(f"Failed to setup TavusTransportClient: {e}")
-            await self._api.end_conversation(self._conversation_id)
-            self._conversation_id = None
+            await self._end_conversation()
 
+    @releases("client")
     async def cleanup(self):
         """Cleanup client resources."""
         await self._end_conversation()
+        if not self._client:
+            return
+
         try:
             await self._client.cleanup()
         except Exception as e:
@@ -322,18 +402,24 @@ class TavusTransportClient:
         """
         return await self._api.get_persona_name(self._persona_id)
 
-    async def start(self, frame: StartFrame):
-        """Start the client and join the room.
+    @acquires("conversation")
+    async def join(self):
+        """Join the room hosting the conversation."""
+        if not self._client:
+            return
 
-        Args:
-            frame: The start frame containing initialization parameters.
-        """
-        logger.debug("TavusTransportClient start invoked!")
-        await self._client.start(frame)
         await self._client.join()
 
+    @releases("conversation")
     async def stop(self):
-        """Stop the client and end the conversation."""
+        """Stop the client and end the conversation.
+
+        Runs once the last of the transports sharing this client has stopped,
+        so the conversation outlives the audio the output transport is flushing.
+        """
+        if not self._client:
+            return
+
         await self._client.leave()
         await self._end_conversation()
 
@@ -366,6 +452,9 @@ class TavusTransportClient:
             video_source: Video source to capture from.
             color_format: Color format for video frames.
         """
+        if not self._client:
+            return
+
         await self._client.capture_participant_video(
             participant_id, callback, framerate, video_source, color_format
         )
@@ -387,6 +476,9 @@ class TavusTransportClient:
             sample_rate: Desired sample rate for audio capture.
             callback_interval_ms: Interval between audio callbacks in milliseconds.
         """
+        if not self._client:
+            return
+
         await self._client.capture_participant_audio(
             participant_id, callback, audio_source, sample_rate, callback_interval_ms
         )
@@ -411,6 +503,10 @@ class TavusTransportClient:
         Returns:
             The output sample rate in Hz.
         """
+        if not self._client:
+            # No client until setup() runs; 0 is what Daily reports before starting.
+            return 0
+
         return self._client.out_sample_rate
 
     @property
@@ -420,6 +516,9 @@ class TavusTransportClient:
         Returns:
             The input sample rate in Hz.
         """
+        if not self._client:
+            return 0
+
         return self._client.in_sample_rate
 
     async def send_interrupt_message(self) -> None:
@@ -432,6 +531,46 @@ class TavusTransportClient:
             }
         )
         await self.send_message(transport_frame)
+
+    async def update_emotion(self, delivery: list[str] | None) -> None:
+        """Set the replica's emotion to follow the delivery of the bot's speech.
+
+        Sends ``conversation.set_emotion`` when the delivery maps to an emotion
+        other than the one last sent. Tavus applies it on arrival, not in step
+        with the audio it has buffered.
+
+        Args:
+            delivery: The delivery of a ``TTSTextFrame``.
+        """
+        emotion = self._delivery_emotion(delivery)
+        if emotion is None or emotion == self._emotion:
+            return
+        self._emotion = emotion
+        transport_frame = OutputTransportMessageUrgentFrame(
+            message={
+                "message_type": "conversation",
+                "event_type": "conversation.set_emotion",
+                "conversation_id": self._conversation_id,
+                "properties": {"emotion": emotion.value},
+            }
+        )
+        await self.send_message(transport_frame)
+
+    def _delivery_emotion(self, delivery: list[str] | None) -> TavusEmotion | None:
+        """The emotion of a delivery's mood, neutral without one, or None to keep the current one."""
+        if delivery is None:
+            return None
+        mood = next(
+            (
+                name
+                for name in delivery
+                if name not in (EMPHASIS_DELIVERY, SLOW_DELIVERY, FAST_DELIVERY)
+            ),
+            None,
+        )
+        if mood is None:
+            return TavusEmotion.NEUTRAL
+        return TAVUS_DELIVERY_EMOTIONS.get(mood, TavusEmotion.NEUTRAL)
 
     async def encode_audio_and_send(
         self, audio: bytes, done: bool, inference_id: str | None
@@ -462,6 +601,9 @@ class TavusTransportClient:
 
     async def start_send_task(self) -> None:
         """Start the audio accumulation and send task."""
+        if not self._task_manager:
+            return
+
         if not self._send_task:
             self._audio_queue = asyncio.Queue()
             self._send_task = self._task_manager.create_task(
@@ -470,10 +612,11 @@ class TavusTransportClient:
 
     async def cancel_send_task(self) -> None:
         """Cancel the send task and discard any buffered audio."""
-        if self._send_task:
+        if self._send_task and self._task_manager:
             await self._task_manager.cancel_task(self._send_task)
             self._send_task = None
             self._audio_queue = None
+        await self._resampler.reset()
 
     async def queue_tts_frame(self, frame: OutputAudioRawFrame | TTSStoppedFrame) -> bool:
         """Add an audio frame or end-of-utterance signal to the send queue.
@@ -523,7 +666,8 @@ class TavusTransportClient:
         await self.encode_audio_and_send(done_silence, True, inference_id)
 
     async def _flush_and_end_utterance(self, audio_buffer: bytearray, inference_id: str) -> None:
-        """Flush remaining buffered audio then send the done marker."""
+        """Flush remaining buffered and resampled audio then send the done marker."""
+        audio_buffer.extend(await self._resampler.flush())
         if audio_buffer:
             await self.encode_audio_and_send(bytes(audio_buffer), False, inference_id)
             audio_buffer.clear()
@@ -538,6 +682,9 @@ class TavusTransportClient:
         TavusOutputTransport on BotStoppedSpeakingFrame, or by TavusVideoService on
         TTSStoppedFrame). Fallback: BOT_VAD_STOP_FALLBACK_SECS timeout.
         """
+        # start_send_task() creates the queue before launching this task.
+        assert self._audio_queue is not None
+
         sample_rate = self.out_sample_rate
         audio_chunk_bytes = int(sample_rate * 2 * 0.1)  # 100ms, 16-bit mono
         audio_buffer = bytearray()
@@ -587,7 +734,7 @@ class TavusTransportClient:
             participant_settings=participant_settings, profile_settings=profile_settings
         )
 
-    async def register_audio_destination(self, destination: str, auto_silence: bool | None = True):
+    async def register_audio_destination(self, destination: str, auto_silence: bool = True):
         """Register an audio destination for output.
 
         Args:
@@ -624,8 +771,6 @@ class TavusInputTransport(BaseInputTransport):
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
-        # Whether we have seen a StartFrame already.
-        self._initialized = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the input transport.
@@ -634,7 +779,9 @@ class TavusInputTransport(BaseInputTransport):
             setup: The frame processor setup configuration.
         """
         await super().setup(setup)
+
         await self._client.setup(setup)
+        await self._client.join()
 
     async def cleanup(self):
         """Cleanup input transport resources."""
@@ -648,13 +795,6 @@ class TavusInputTransport(BaseInputTransport):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
-
-        if self._initialized:
-            return
-
-        self._initialized = True
-
-        await self._client.start(frame)
         await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
@@ -728,13 +868,22 @@ class TavusOutputTransport(BaseOutputTransport):
         self._client = client
         self._params = params
 
-        # Whether we have seen a StartFrame already.
-        self._initialized = False
-
         # Pacing state used when audio isn't sent faster than realtime (see
         # write_audio_frame/_write_audio_sleep).
         self._send_interval: float = 0
         self._next_send_time: float = 0
+
+    @property
+    def capabilities(self) -> BotCapabilities:
+        """The media this transport sends to the user.
+
+        The Tavus avatar publishes its video to the room itself, so the user
+        receives bot video even though this transport sends none.
+
+        Returns:
+            The ``audio_out`` capability, with ``video_out`` set.
+        """
+        return super().capabilities.override(BotCapabilities(video_out=True))
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the output transport.
@@ -743,7 +892,11 @@ class TavusOutputTransport(BaseOutputTransport):
             setup: The frame processor setup configuration.
         """
         await super().setup(setup)
+        if warning := tavus_policy_warning(setup.expression_policy):
+            logger.warning(f"{self}: {warning}")
+
         await self._client.setup(setup)
+        await self._client.join()
 
     async def cleanup(self):
         """Cleanup output transport resources."""
@@ -751,7 +904,14 @@ class TavusOutputTransport(BaseOutputTransport):
         await self._client.cleanup()
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
-        """Signal end of utterance when bot stops speaking."""
+        """Signal end of utterance when bot stops speaking, and follow the bot's delivery.
+
+        A ``TTSTextFrame`` with a presentation timestamp reaches here when the
+        transport's clock releases it, as its words are heard, so the replica's
+        emotion changes in step with the audio.
+        """
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, TTSTextFrame):
+            await self._client.update_emotion(frame.delivery)
         if direction == FrameDirection.DOWNSTREAM and isinstance(frame, BotStoppedSpeakingFrame):
             # Handle BotStoppedSpeakingFrame because, by the time it is received, the base output transport
             # has already sent all audio frames via write_audio_frame(). At this point it is safe to mark
@@ -770,17 +930,13 @@ class TavusOutputTransport(BaseOutputTransport):
         """
         await super().start(frame)
 
-        if self._initialized:
-            return
-
-        self._initialized = True
-
-        await self._client.start(frame)
         if self._params.audio_out_faster_than_realtime:
             await self._client.start_send_task()
         else:
-            self._send_interval = (self.audio_chunk_size / self._client.out_sample_rate) / 2
+            bytes_per_second = self._client.out_sample_rate * self._params.audio_out_channels * 2
+            self._send_interval = self.audio_chunk_size / bytes_per_second
             self._next_send_time = 0
+
         await self.set_transport_ready(frame)
 
     async def stop(self, frame: EndFrame):
@@ -891,7 +1047,7 @@ class TavusTransport(BaseTransport):
         api_key: str,
         replica_id: str,
         persona_id: str = "pipecat0",
-        params: TavusParams = TavusParams(),
+        params: TavusParams | None = None,
         input_name: str | None = None,
         output_name: str | None = None,
     ):
@@ -910,6 +1066,7 @@ class TavusTransport(BaseTransport):
             input_name: Optional name for the input transport.
             output_name: Optional name for the output transport.
         """
+        params = params or TavusParams()
         super().__init__(input_name=input_name, output_name=output_name)
         self._params = params
 
@@ -919,7 +1076,7 @@ class TavusTransport(BaseTransport):
             on_participant_left=self._on_participant_left,
         )
         self._client = TavusTransportClient(
-            bot_name="Pipecat",
+            bot_name=bot_name,
             callbacks=callbacks,
             api_key=api_key,
             replica_id=replica_id,

@@ -131,8 +131,11 @@ class LLMAutoContextSummarizationConfig:
         max_context_tokens: Maximum allowed context size in tokens. When this
             limit is reached, summarization is triggered to compress the context.
             The tokens are calculated using the industry-standard approximation
-            of 1 token ≈ 4 characters. Set to ``None`` to disable token-based
-            triggering.
+            of 1 token ≈ 4 characters. This measures the context messages only:
+            the LLM service's ``system_instruction`` is sent on every inference
+            but is not part of the context, and summarization cannot compress
+            it. Size this limit against the model's window minus the
+            instruction. Set to ``None`` to disable token-based triggering.
         max_unsummarized_messages: Maximum number of new messages that can
             accumulate since the last summary before triggering a new
             summarization. This ensures regular compression even if token
@@ -164,7 +167,9 @@ class LLMAutoContextSummarizationConfig:
             and self.summary_config.target_context_tokens > self.max_context_tokens
         ):
             # Use 80% of max_context_tokens as a reasonable default
-            self.summary_config.target_context_tokens = int(self.max_context_tokens * 0.8)
+            self.summary_config.target_context_tokens = int(
+                self.max_context_tokens * SUMMARY_TOKEN_BUFFER
+            )
 
 
 @deprecated(
@@ -227,7 +232,7 @@ class LLMContextSummarizationConfig:
             and self.target_context_tokens > self.max_context_tokens
         ):
             # Use 80% of max_context_tokens as a reasonable default
-            self.target_context_tokens = int(self.max_context_tokens * 0.8)
+            self.target_context_tokens = int(self.max_context_tokens * SUMMARY_TOKEN_BUFFER)
 
         if self.max_unsummarized_messages is not None and self.max_unsummarized_messages < 1:
             raise ValueError("max_unsummarized_messages must be at least 1")
@@ -334,11 +339,9 @@ class LLMContextSummarizationUtil:
             context: LLM context to estimate.
 
         Returns:
-            Estimated total token count including:
-            - Message content (text, images)
-            - Tool calls and their arguments
-            - Tool results
-            - Structural overhead (TOKEN_OVERHEAD_PER_MESSAGE per message)
+            The estimated total token count, covering message content (text and
+            images), tool calls and their arguments, tool results, and
+            ``TOKEN_OVERHEAD_PER_MESSAGE`` of structural overhead per message.
         """
         total = 0
 
@@ -581,7 +584,7 @@ class LLMContextSummarizationUtil:
         )
 
     @staticmethod
-    def format_messages_for_summary(messages: list[dict]) -> str:
+    def format_messages_for_summary(messages: list[LLMContextMessage]) -> str:
         """Format messages as a transcript for summarization.
 
         Args:
@@ -616,7 +619,8 @@ class LLMContextSummarizationUtil:
             else:
                 text = str(content)
 
-            if text:
+            # A tool message's text is written once, as its TOOL_RESULT line below.
+            if text and role != "tool":
                 # Capitalize role for readability
                 formatted_role = role.upper()
                 transcript_parts.append(f"{formatted_role}: {text}")

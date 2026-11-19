@@ -33,6 +33,7 @@ from pipecat.frames.frames import (
     OutputTransportMessageUrgentFrame,
     StartFrame,
 )
+from pipecat.pipeline.capabilities import BotCapabilities
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor, FrameProcessorSetup
 from pipecat.transports.base_input import BaseInputTransport
 from pipecat.transports.base_output import BaseOutputTransport
@@ -43,6 +44,7 @@ from pipecat.transports.daily.transport import (
     DailyTransportClient,
 )
 from pipecat.transports.lemonslice.api import LemonSliceApi
+from pipecat.utils.shared import acquires, releases
 
 
 class LemonSliceNewSessionRequest(BaseModel):
@@ -58,6 +60,9 @@ class LemonSliceNewSessionRequest(BaseModel):
         agent_prompt: A high-level system prompt that subtly influences the avatar's movements,
             expressions, and emotional demeanor.
         idle_timeout: Idle timeout in seconds.
+        audio_sample_rate: Sample rate the avatar captures your audio at and plays it back at.
+            One of 16000, 22050, 24000, 44100 or 48000.
+        model: The LemonSlice model to run the avatar on. Uses the default model when unset.
         daily_room_url: Daily room URL to use for the session.
         daily_token: Daily token for authenticating with the room.
         lemonslice_properties: Additional connection properties to pass to the session.
@@ -71,6 +76,8 @@ class LemonSliceNewSessionRequest(BaseModel):
     agent_image: Image.Image | None = None
     agent_prompt: str | None = None
     idle_timeout: int | None = None
+    audio_sample_rate: int = 24000
+    model: str | None = None
     daily_room_url: str | None = None
     daily_token: str | None = None
     lemonslice_properties: dict | None = None
@@ -134,7 +141,7 @@ class LemonSliceTransportClient:
         self,
         *,
         bot_name: str,
-        params: LemonSliceParams = LemonSliceParams(),
+        params: LemonSliceParams | None = None,
         callbacks: LemonSliceCallbacks,
         api_key: str,
         session_request: LemonSliceNewSessionRequest | None = None,
@@ -150,6 +157,7 @@ class LemonSliceTransportClient:
             session_request: Session creation parameters.
             session: The aiohttp session for making async HTTP requests.
         """
+        params = params or LemonSliceParams()
         self._bot_name = bot_name
         self._api = LemonSliceApi(api_key, session)
         if session_request is None:
@@ -174,6 +182,8 @@ class LemonSliceTransportClient:
             agent_image=self._session_request.agent_image,
             agent_prompt=self._session_request.agent_prompt,
             idle_timeout=self._session_request.idle_timeout,
+            audio_sample_rate=self._session_request.audio_sample_rate,
+            model=self._session_request.model,
             daily_room_url=self._session_request.daily_room_url,
             daily_token=self._session_request.daily_token,
             connection_properties=connection_properties if connection_properties else None,
@@ -184,15 +194,13 @@ class LemonSliceTransportClient:
         self._control_url = response["control_url"]
         return response["room_url"]
 
+    @acquires("client")
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the client and initialize the conversation.
 
         Args:
             setup: The frame processor setup configuration.
         """
-        if self._session_id is not None:
-            logger.debug(f"Session ID already defined: {self._session_id}")
-            return
         try:
             room_url = await self._initialize()
             daily_callbacks = DailyCallbacks(
@@ -218,6 +226,9 @@ class LemonSliceTransportClient:
                 on_dialout_error=partial(self._on_handle_callback, "on_dialout_error"),
                 on_dialout_warning=partial(self._on_handle_callback, "on_dialout_warning"),
                 on_dtmf_event=partial(self._on_handle_callback, "on_dtmf_event"),
+                on_network_connection_status_updated=partial(
+                    self._on_handle_callback, "on_network_connection_status_updated"
+                ),
                 on_participant_joined=self._callbacks.on_participant_joined,
                 on_participant_left=self._callbacks.on_participant_left,
                 on_participant_updated=partial(self._on_handle_callback, "on_participant_updated"),
@@ -241,6 +252,7 @@ class LemonSliceTransportClient:
             await self._end_session()
             raise
 
+    @releases("client")
     async def cleanup(self):
         """Cleanup client resources."""
         try:
@@ -286,11 +298,16 @@ class LemonSliceTransportClient:
         Args:
             frame: The start frame containing initialization parameters.
         """
-        await self._daily_transport_client.start(frame)
+        if not self._daily_transport_client:
+            return
+
         await self._daily_transport_client.join()
 
     async def stop(self):
         """Stop the client and end the conversation."""
+        if not self._daily_transport_client:
+            return
+
         await self._daily_transport_client.leave()
         await self._end_session()
 
@@ -311,6 +328,9 @@ class LemonSliceTransportClient:
             video_source: Video source to capture from.
             color_format: Color format for video frames.
         """
+        if not self._daily_transport_client:
+            return
+
         await self._daily_transport_client.capture_participant_video(
             participant_id, callback, framerate, video_source, color_format
         )
@@ -332,6 +352,9 @@ class LemonSliceTransportClient:
             sample_rate: Desired sample rate for audio capture.
             callback_interval_ms: Interval between audio callbacks in milliseconds.
         """
+        if not self._daily_transport_client:
+            return
+
         await self._daily_transport_client.capture_participant_audio(
             participant_id, callback, audio_source, sample_rate, callback_interval_ms
         )
@@ -356,6 +379,10 @@ class LemonSliceTransportClient:
         Returns:
             The output sample rate in Hz.
         """
+        if not self._daily_transport_client:
+            # No client until setup() runs; 0 is what Daily reports before starting.
+            return 0
+
         return self._daily_transport_client.out_sample_rate
 
     @property
@@ -365,6 +392,10 @@ class LemonSliceTransportClient:
         Returns:
             The input sample rate in Hz.
         """
+        if not self._daily_transport_client:
+            # No client until setup() runs; 0 is what Daily reports before starting.
+            return 0
+
         return self._daily_transport_client.in_sample_rate
 
     async def send_interrupt_message(self) -> None:
@@ -463,8 +494,6 @@ class LemonSliceInputTransport(BaseInputTransport):
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
-        # Whether we have seen a StartFrame already.
-        self._initialized = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the input transport.
@@ -487,11 +516,6 @@ class LemonSliceInputTransport(BaseInputTransport):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
-
-        if self._initialized:
-            return
-
-        self._initialized = True
 
         await self._client.start(frame)
         await self.set_transport_ready(frame)
@@ -573,10 +597,20 @@ class LemonSliceOutputTransport(BaseOutputTransport):
         self._client = client
         self._params = params
 
-        # Whether we have seen a StartFrame already.
-        self._initialized = False
         # This is the custom track destination expected by LemonSlice
         self._transport_destination: str | None = "stream"
+
+    @property
+    def capabilities(self) -> BotCapabilities:
+        """The media this transport sends to the user.
+
+        The LemonSlice avatar publishes its video to the room itself, so the user
+        receives bot video even though this transport sends none.
+
+        Returns:
+            The ``audio_out`` capability, with ``video_out`` set.
+        """
+        return super().capabilities.override(BotCapabilities(video_out=True))
 
     async def setup(self, setup: FrameProcessorSetup):
         """Setup the output transport.
@@ -599,11 +633,6 @@ class LemonSliceOutputTransport(BaseOutputTransport):
             frame: The start frame containing initialization parameters.
         """
         await super().start(frame)
-
-        if self._initialized:
-            return
-
-        self._initialized = True
 
         await self._client.start(frame)
 
@@ -729,7 +758,7 @@ class LemonSliceTransport(BaseTransport):
         session: aiohttp.ClientSession,
         api_key: str,
         session_request: LemonSliceNewSessionRequest | None = None,
-        params: LemonSliceParams = LemonSliceParams(),
+        params: LemonSliceParams | None = None,
         input_name: str | None = None,
         output_name: str | None = None,
     ):
@@ -745,6 +774,7 @@ class LemonSliceTransport(BaseTransport):
             input_name: Optional name for the input transport.
             output_name: Optional name for the output transport.
         """
+        params = params or LemonSliceParams()
         super().__init__(input_name=input_name, output_name=output_name)
         self._params = params
 

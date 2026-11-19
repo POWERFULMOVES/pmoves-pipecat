@@ -11,34 +11,30 @@ import inspect
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, ClassVar, cast
 
+import aiohttp
 from loguru import logger
 
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
+    ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
-    StartFrame,
     TranscriptionFrame,
-    VADUserStartedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.settings import (
-    NOT_GIVEN,
-    STTSettings,
-    _NotGiven,
-    is_given,
-)
-from pipecat.services.stt_latency import DEEPGRAM_TTFS_P99
-from pipecat.services.stt_service import STTService
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.services.settings import STTSettings
+from pipecat.services.stt_latency import DEEPGRAM_SEGMENTED_TTFS_P99, DEEPGRAM_TTFS_P99
+from pipecat.services.stt_service import SegmentedSTTService, STTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.network import QuickFailureTracker, exponential_backoff_time
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 try:
     from deepgram import AsyncDeepgramClient
@@ -182,21 +178,29 @@ class LiveOptions:
 
 
 @dataclass
-class DeepgramSTTSettings(STTSettings):
-    """Settings for DeepgramSTTService.
+class BaseDeepgramSTTSettings(STTSettings):
+    """Settings both Deepgram speech-to-text APIs accept, streaming and pre-recorded.
+
+    The base of :class:`DeepgramSTTSettings` and
+    :class:`DeepgramSegmentedSTTSettings`, which add the settings only their
+    own API accepts.
 
     ``model`` and ``language`` are inherited from ``STTSettings`` /
-    ``ServiceSettings``.  Additional Deepgram connection params may
+    ``ServiceSettings``.  Additional Deepgram request params may
     be passed in through ``extra`` (also inherited).
 
     Parameters:
         detect_entities: Enable named entity detection.
-        diarize: Enable speaker diarization.
+        diarize: Enable speaker diarization. Each contiguous speaker run of a
+            final result is emitted as its own frame with Deepgram's speaker number
+            (``"0"``, ``"1"``, ...) as ``speaker.label``.
         dictation: Enable dictation mode (converts commands to punctuation).
-        endpointing: Endpointing sensitivity in ms, or ``False`` to disable.
-        interim_results: Whether to emit interim transcriptions.
         keyterm: Keyterms to boost (str or list of str).
         keywords: Keywords to boost (str or list of str).
+        language_hint: BCP-47 language tag, or list of tags, biasing language
+            detection on Nova-3 multilingual. Deepgram ignores it unless the
+            request sets ``model="nova-3"`` and ``language="multi"``, and
+            rejects a tag the multilingual model does not cover.
         numerals: Convert spoken numbers to numerals.
         profanity_filter: Filter profanity from transcripts.
         punctuate: Add punctuation to transcripts.
@@ -204,24 +208,35 @@ class DeepgramSTTSettings(STTSettings):
         replace: Word replacement rules (str or list).
         search: Search terms to highlight (str or list of str).
         smart_format: Apply smart formatting to transcripts.
-        utterance_end_ms: Silence duration in ms before an utterance-end event.
+        version: Model version to transcribe with, e.g. a dated standard-model
+            version such as ``"2021-03-17.0"`` or a custom model's version id.
+            ``None`` omits the parameter, leaving Deepgram on ``"latest"``.
+        speaker_format: Optional format string for diarized speaker runs. Use ``{speaker}`` for the
+            speaker label, ``{text}`` for the transcript text, and ``{speaker_number}`` for the
+            speaker's order of first appearance in the session (``1``, ``2``, ...), e.g.
+            ``"{speaker}: {text}"``. If ``None``, transcript text is not modified. Applied locally,
+            so changing it does not reconnect.
     """
 
-    detect_entities: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    diarize: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    dictation: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    endpointing: Any | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    interim_results: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    keyterm: Any | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    keywords: Any | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    numerals: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    profanity_filter: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    punctuate: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    redact: Any | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    replace: Any | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    search: Any | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    smart_format: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    utterance_end_ms: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    detect_entities: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarize: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    dictation: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    keyterm: Any | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    keywords: Any | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language_hint: str | list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    numerals: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    profanity_filter: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    punctuate: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    redact: Any | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    replace: Any | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    search: Any | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    smart_format: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    version: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speaker_format: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+    #: Fields applied locally to transcripts — never sent to Deepgram, and
+    #: changing them needs no reconnect.
+    LOCAL_FIELDS: ClassVar[frozenset[str]] = frozenset({"speaker_format"})
 
     def _sync_extra_to_fields(self) -> None:
         """Sync values from extra dict to declared fields.
@@ -250,6 +265,24 @@ class DeepgramSTTSettings(STTSettings):
                     setattr(self, key, self.extra[key])
                 # Always remove from extra to avoid ambiguity
                 del self.extra[key]
+
+
+@dataclass
+class DeepgramSTTSettings(BaseDeepgramSTTSettings):
+    """Settings for DeepgramSTTService.
+
+    ``language_hint`` requires deepgram-sdk 7.15.0 or later.
+
+    Parameters:
+        endpointing: Endpointing sensitivity in ms, or ``False`` to disable.
+        interim_results: Whether to emit interim transcriptions. Interim
+            results are not split by speaker.
+        utterance_end_ms: Silence duration in ms before an utterance-end event.
+    """
+
+    endpointing: Any | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    interim_results: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    utterance_end_ms: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 def _derive_deepgram_urls(base_url: str) -> tuple[str, str]:
@@ -361,14 +394,17 @@ class DeepgramSTTService(STTService):
             interim_results=True,
             keyterm=None,
             keywords=None,
+            language_hint=None,
             numerals=False,
-            profanity_filter=True,
+            profanity_filter=None,
             punctuate=True,
             redact=None,
             replace=None,
             search=None,
             smart_format=False,
             utterance_end_ms=None,
+            version=None,
+            speaker_format=None,
         )
 
         # 2. (No step 2, as there are no deprecated direct args)
@@ -412,6 +448,11 @@ class DeepgramSTTService(STTService):
 
         # 4. Apply settings delta (canonical API, always wins)
         if settings is not None:
+            # Sync the delta first: on a delta, an unset field is NOT_GIVEN, so a
+            # matching extra key can still be promoted. On the merged store every
+            # field already holds a default and the value would be dropped.
+            settings = settings.copy()
+            settings._sync_extra_to_fields()
             default_settings.apply_update(settings)
 
         # Sync extra to top-level fields so self._settings is unambiguous
@@ -460,11 +501,15 @@ class DeepgramSTTService(STTService):
 
         self._connection = None
         self._connection_task = None
-        self._connection_ready = asyncio.Event()
-        # Rapid failure detection: if the connection dies within
-        # QuickFailureTracker.min_stable_duration of connecting (e.g. an invalid
-        # API key rejected at the WebSocket handshake) enough times in a row,
-        # stop retrying instead of looping forever. Shared with WebsocketService.
+
+        # Set once connecting has resolved, whether it connected or gave up, so
+        # that setting the service up doesn't outlast the attempt it started.
+        self._connection_settled = asyncio.Event()
+
+        # Rapid failure detection: if the connection keeps failing to stay up for
+        # QuickFailureTracker.min_stable_duration (e.g. an invalid API key
+        # rejected at the WebSocket handshake) enough times in a row, stop
+        # retrying instead of looping forever. Shared with WebsocketService.
         self._quick_failure_tracker = QuickFailureTracker()
 
     def can_generate_metrics(self) -> bool:
@@ -476,25 +521,27 @@ class DeepgramSTTService(STTService):
         return True
 
     async def _do_reconnect(self):
-        """Disconnect and reconnect to Deepgram, waiting until ready.
+        """Disconnect and reconnect to Deepgram.
 
         Called by ``STTService._reconnect()`` inside the reconnecting guard.
-        Unlike ``WebsocketSTTService``, Deepgram's ``_connect()`` only
-        launches a background task — the actual WebSocket handshake happens
-        asynchronously. This method waits for ``_connection_ready`` to be set
-        before returning so that buffered audio frames are replayed only after
-        the new connection can accept them.
+        ``_connect()`` returns once connecting has resolved, so a connection
+        that is still missing by then is one that isn't coming back: say so
+        rather than let the caller replay buffered audio into nothing.
 
         Raises:
-            asyncio.TimeoutError: If the connection is not established within
-                05 seconds.
+            ConnectionError: If the service could not reconnect.
         """
         await self._disconnect()
         await self._connect()
-        await asyncio.wait_for(self._connection_ready.wait(), timeout=5.0)
+        if not self._connection:
+            raise ConnectionError(f"{self} could not reconnect to Deepgram")
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
-        """Apply a settings delta and reconnect if anything changed."""
+        """Apply a settings delta and reconnect if a connection setting changed."""
+        if isinstance(delta, self.Settings):
+            delta = delta.copy()
+            delta._sync_extra_to_fields()
+
         changed = await super()._update_settings(delta)
 
         if not changed:
@@ -504,17 +551,18 @@ class DeepgramSTTService(STTService):
         if isinstance(self._settings, self.Settings):
             self._settings._sync_extra_to_fields()
 
-        await self._request_reconnect()
+        if changed.keys() - self.Settings.LOCAL_FIELDS:
+            await self._request_reconnect()
 
         return changed
 
-    async def start(self, frame: StartFrame):
-        """Start the Deepgram STT service.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
 
         Args:
-            frame: The start frame containing initialization parameters.
+            setup: Configuration object containing setup parameters.
         """
-        await super().start(frame)
+        await super().setup(setup)
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -565,6 +613,8 @@ class DeepgramSTTService(STTService):
         # Declared Deepgram-specific fields
         for f in fields(s):
             if f.name in ("model", "language", "extra") or f.name.startswith("_"):
+                continue
+            if f.name in self.Settings.LOCAL_FIELDS:
                 continue
             value = getattr(s, f.name)
             if not is_given(value) or value is None:
@@ -619,18 +669,17 @@ class DeepgramSTTService(STTService):
     async def _connect(self):
         logger.debug("Connecting to Deepgram")
         self._quick_failure_tracker.reset()
+        self._connection_settled.clear()
         self._connection_task = self.create_task(self._connection_handler())
+        await self._connection_settled.wait()
 
     async def _disconnect(self):
         if not self._connection_task:
             return
 
-        logger.debug("Disconnecting from Deepgram")
-        # Clear _connection and _connection_ready first to prevent run_stt
-        # from sending audio during the close handshake, and to ensure any
-        # concurrent _do_reconnect() waiter sees a clean state before the
-        # new connection is established.
-        self._connection_ready.clear()
+        logger.debug(f"{self}: Disconnecting from Deepgram")
+        # Clear the connection first to prevent run_stt from sending audio
+        # during the close handshake.
         connection = self._connection
         self._connection = None
 
@@ -643,59 +692,68 @@ class DeepgramSTTService(STTService):
     async def _connection_handler(self):
         """Manages the full WebSocket lifecycle inside a single async with block.
 
-        Reconnects automatically after transient errors, with exponential
-        backoff between attempts. A 4xx ``ApiError`` (e.g. an invalid API key
-        rejected at the handshake) stops retrying immediately, since the SDK
-        has already told us the request itself is bad. Any other error that
-        keeps failing quickly is also tracked by ``_quick_failure_tracker``,
-        which gives up after enough consecutive quick failures so a
-        persistent problem can't retry forever unnoticed. Exits cleanly when
-        the task is cancelled (i.e. on stop/cancel).
+        Reconnects automatically after an error, with exponential backoff
+        between attempts, and gives up once enough attempts in a row have
+        failed to produce a connection that stays up. A 4xx ``ApiError``
+        (e.g. an invalid API key rejected at the handshake) gives up at once,
+        since the SDK has already told us the request itself is bad. Giving up
+        leaves the service unusable either way, so a ``ServiceSwitcher`` can
+        move off it. Exits cleanly when the task is cancelled (i.e. on
+        stop/cancel).
         """
-        while True:
-            connect_kwargs = self._build_connect_kwargs()
-            keepalive_task = None
-            attempt_start = time.monotonic()
-            try:
-                async with self._client.listen.v1.connect(**connect_kwargs) as connection:
-                    self._connection = connection
-                    self._connection_ready.set()
-                    connection.on(EventType.MESSAGE, self._on_message)
-                    connection.on(EventType.ERROR, self._on_error)
+        try:
+            while True:
+                connect_kwargs = self._build_connect_kwargs()
+                keepalive_task = None
+                connected_at = None
+                try:
+                    async with self._client.listen.v1.connect(**connect_kwargs) as connection:
+                        connected_at = time.monotonic()
+                        self._connection = connection
+                        self._connection_settled.set()
+                        connection.on(EventType.MESSAGE, self._on_message)
+                        connection.on(EventType.ERROR, self._on_error)
 
-                    logger.debug(f"{self}: Websocket connection initialized")
+                        logger.debug(f"{self}: Websocket connection initialized")
 
-                    keepalive_task = self.create_task(
-                        self._keepalive_handler(), f"{self}::keepalive"
+                        keepalive_task = self.create_task(
+                            self._keepalive_handler(), f"{self}::keepalive"
+                        )
+                        await connection.start_listening()
+                except ApiError as e:
+                    if e.status_code is not None and 400 <= e.status_code < 500:
+                        msg = f"Deepgram rejected the connection (status {e.status_code}): {e}"
+                        await self.push_error(
+                            error_msg=msg, exception=e, force_treat_as_permanent=True
+                        )
+                        return
+                    logger.warning(f"{self}: Connection lost, will retry: {e}")
+                    await self.push_error(error_msg=f"connection error: {e}", exception=e)
+                except Exception as e:
+                    logger.warning(f"{self}: Connection lost, will retry: {e}")
+                    await self.push_error(error_msg=f"connection error: {e}", exception=e)
+                finally:
+                    self._connection = None
+                    if keepalive_task:
+                        await self.cancel_task(keepalive_task)
+
+                # How long the connection lasted, which is nothing at all when
+                # the handshake never completed. Timing the attempt instead
+                # would read a handshake that hangs before failing as a healthy
+                # connection and keep retrying it forever.
+                uptime = time.monotonic() - connected_at if connected_at is not None else 0.0
+                if self._quick_failure_tracker.record(uptime).should_give_up:
+                    msg = (
+                        "connection failed to stay up "
+                        f"{self._quick_failure_tracker.max_consecutive_failures} times in a row"
                     )
-                    await connection.start_listening()
-            except ApiError as e:
-                if e.status_code is not None and 400 <= e.status_code < 500:
-                    msg = f"Deepgram rejected the connection (status {e.status_code}): {e}"
-                    await self.push_error(error_msg=msg, exception=e)
+                    await self.push_error(error_msg=msg, force_treat_as_permanent=True)
                     return
-                logger.warning(f"{self}: Connection lost, will retry: {e}")
-                await self.push_error(error_msg=f"connection error: {e}", exception=e)
-            except Exception as e:
-                logger.warning(f"{self}: Connection lost, will retry: {e}")
-                await self.push_error(error_msg=f"connection error: {e}", exception=e)
-            finally:
-                self._connection_ready.clear()
-                self._connection = None
-                if keepalive_task:
-                    await self.cancel_task(keepalive_task)
-
-            duration = time.monotonic() - attempt_start
-            result = self._quick_failure_tracker.record(duration)
-            if result.should_give_up:
-                msg = (
-                    "connection failed "
-                    f"{self._quick_failure_tracker.max_consecutive_failures} times "
-                    "immediately after connecting"
-                )
-                await self.push_error(error_msg=msg)
-                return
-            await asyncio.sleep(exponential_backoff_time(self._quick_failure_tracker.count))
+                await asyncio.sleep(exponential_backoff_time(self._quick_failure_tracker.count))
+        finally:
+            # Nothing further will be attempted, so whoever is waiting for the
+            # service to connect can stop waiting.
+            self._connection_settled.set()
 
     async def _keepalive_handler(self):
         """Periodically send KeepAlive frames to prevent server-side timeout.
@@ -711,10 +769,6 @@ class DeepgramSTTService(STTService):
                     logger.trace(f"{self}: Sent keepalive")
                 except Exception as e:
                     logger.warning(f"{self}: Keepalive failed: {e}")
-
-    async def _start_metrics(self):
-        """Start processing metrics collection for this utterance."""
-        await self.start_processing_metrics()
 
     async def _on_error(self, error):
         logger.warning(f"{self} connection error, will retry: {error}")
@@ -747,26 +801,25 @@ class DeepgramSTTService(STTService):
                 if from_finalize:
                     self.confirm_finalize()
                 if len(transcript) > 0:
+                    words = None
+                    if self._settings.diarize:
+                        words = [
+                            (word.punctuated_word or word.word, word.speaker)
+                            for word in message.channel.alternatives[0].words or []
+                        ]
+                    runs = self._diarized_runs(transcript, words)
                     # Report usage before the transcription frame so tracing can
                     # attach it to the STT span the frame closes.
                     await self.emit_stt_usage_metrics()
-                    await self.push_frame(
-                        TranscriptionFrame(
-                            transcript,
-                            self._user_id,
-                            time_now_iso8601(),
-                            language,
-                            result=message,
-                        )
-                    )
+                    await self._push_transcription_runs(runs, language=language, result=message)
                     await self._handle_transcription(transcript, is_final, language)
-                    await self.stop_processing_metrics()
                 elif from_finalize:
-                    # Deepgram already sent the transcript via a regular is_final
-                    # before the finalize response arrived (empty). Report STT TTFB
-                    # immediately instead of falling to the timeout.
-                    await self.stop_ttfb_metrics()
-                    await self._cancel_ttfb_timeout()
+                    # Deepgram's own endpointing already sent the transcript in
+                    # a regular is_final, before it was asked to finalize, so
+                    # the confirmation has no text to mark as finalized. Push it
+                    # on its own: that finalizes those transcripts for the
+                    # pipeline and reports the STT TTFB.
+                    await self._push_transcription_finalized()
             elif len(transcript) > 0:
                 # For interim transcriptions, just push the frame without tracing
                 await self.push_frame(
@@ -788,12 +841,332 @@ class DeepgramSTTService(STTService):
         """
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, VADUserStartedSpeakingFrame):
-            await self._start_metrics()
-        elif isinstance(frame, VADUserStoppedSpeakingFrame):
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
             # https://developers.deepgram.com/docs/finalize
             # Mark that we're awaiting a from_finalize response
             if self._connection:
                 self.request_finalize()
                 await self._connection.send_finalize(ListenV1Finalize(type="Finalize"))
                 logger.trace(f"Triggered finalize event on: {frame.name=}, {direction=}")
+
+
+@dataclass
+class DeepgramSegmentedSTTSettings(BaseDeepgramSTTSettings):
+    """Settings for :class:`DeepgramSegmentedSTTService`.
+
+    Each setting is sent as the Deepgram query parameter of the same name,
+    except ``diarize`` (see ``diarize_model``) and the local ``speaker_format``,
+    and ``None`` leaves it out. Any other Deepgram pre-recorded query parameter
+    can be passed through ``extra``.
+
+    Parameters:
+        detect_language: Detect the spoken language and transcribe in it,
+            overriding ``language``. The detected language is reported on the
+            transcript.
+        diarize_model: The diarization model ``diarize`` turns on: ``"latest"``
+            or a version such as ``"v2"``. Diarization is requested with this
+            parameter alone, since Deepgram's ``diarize`` parameter selects its
+            oldest model and is refused alongside ``diarize_model``.
+        filler_words: Include filler words such as "uh" and "um".
+    """
+
+    detect_language: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarize_model: str | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    filler_words: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+
+
+def _query_values(value: Any) -> list[str]:
+    """Encode a setting as query parameter values.
+
+    A list becomes one value per item, sent as a repeated parameter, and a
+    bool is spelled the way Deepgram expects (``true``/``false``).
+    """
+    items = value if isinstance(value, list) else [value]
+    return [str(item).lower() if isinstance(item, bool) else str(item) for item in items]
+
+
+class DeepgramSegmentedSTTService(SegmentedSTTService):
+    """Deepgram speech-to-text service using the pre-recorded API.
+
+    Transcribes each speech segment with one request to Deepgram's
+    pre-recorded API (``POST /v1/listen``) instead of streaming audio over a
+    WebSocket. It inherits from :class:`SegmentedSTTService`, which uses VAD
+    events to buffer each utterance and calls :meth:`run_stt` once per segment
+    with the audio as a WAV container. Transcripts are final only; there are
+    no interim results.
+
+    Settings are read for every request, so an update applies from the next
+    segment.
+    """
+
+    Settings = DeepgramSegmentedSTTSettings
+    _settings: Settings
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        aiohttp_session: aiohttp.ClientSession,
+        base_url: str = "https://api.deepgram.com",
+        sample_rate: int | None = None,
+        tag: str | list[str] | None = None,
+        mip_opt_out: bool | None = None,
+        settings: Settings | None = None,
+        ttfs_p99_latency: float | None = DEEPGRAM_SEGMENTED_TTFS_P99,
+        **kwargs,
+    ):
+        """Initialize the Deepgram segmented STT service.
+
+        Args:
+            api_key: Deepgram API key for authentication.
+            aiohttp_session: aiohttp ClientSession for HTTP requests.
+            base_url: Base URL for the Deepgram API. Override for a regional
+                endpoint (e.g. ``https://api.eu.deepgram.com``) or a
+                self-hosted deployment.
+            sample_rate: Audio sample rate in Hz. If not provided, uses the
+                pipeline's rate.
+            tag: Custom billing tag (str or list of str).
+            mip_opt_out: Opt out of Deepgram's Model Improvement Program.
+            settings: Runtime-updatable settings.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in
+                seconds. Override for your deployment. See
+                https://github.com/pipecat-ai/stt-benchmark
+            **kwargs: Additional arguments passed to SegmentedSTTService.
+        """
+        default_settings = self.Settings(
+            model="nova-3-general",
+            language=Language.EN,
+            detect_entities=False,
+            detect_language=False,
+            diarize=False,
+            diarize_model="latest",
+            dictation=False,
+            filler_words=False,
+            keyterm=None,
+            keywords=None,
+            language_hint=None,
+            numerals=False,
+            profanity_filter=None,
+            punctuate=True,
+            redact=None,
+            replace=None,
+            search=None,
+            smart_format=False,
+            version=None,
+            speaker_format=None,
+        )
+        if settings is not None:
+            # Sync the delta first: on a delta, an unset field is NOT_GIVEN, so a
+            # matching extra key can still be promoted.
+            settings = settings.copy()
+            settings._sync_extra_to_fields()
+            default_settings.apply_update(settings)
+        default_settings._sync_extra_to_fields()
+
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            settings=default_settings,
+            **kwargs,
+        )
+
+        self._api_key = api_key
+        self._session = aiohttp_session
+        self._base_url = base_url.rstrip("/")
+        self._tag = tag
+        self._mip_opt_out = mip_opt_out
+
+    def can_generate_metrics(self) -> bool:
+        """Whether this service generates processing metrics.
+
+        Returns:
+            True. Each segment is a discrete request, so its duration is
+            measured and reported.
+        """
+        return True
+
+    async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
+        """Apply a settings delta, promoting extra keys that name a setting."""
+        if isinstance(delta, self.Settings):
+            delta = delta.copy()
+            delta._sync_extra_to_fields()
+        changed = await super()._update_settings(delta)
+        self._settings._sync_extra_to_fields()
+        return changed
+
+    def _query_params(self) -> list[tuple[str, str]]:
+        """Build the request's query parameters from the current settings."""
+        params: dict[str, Any] = {}
+        for f in fields(self._settings):
+            if f.name == "extra" or f.name.startswith("_"):
+                continue
+            if f.name in self.Settings.LOCAL_FIELDS:
+                continue
+            params[f.name] = getattr(self._settings, f.name)
+        diarize = params.pop("diarize")
+        diarize_model = params.pop("diarize_model")
+        if diarize:
+            params["diarize_model"] = diarize_model
+        params["tag"] = self._tag
+        params["mip_opt_out"] = self._mip_opt_out
+        params.update(self._settings.extra)
+
+        return [
+            (name, encoded)
+            for name, value in params.items()
+            if is_given(value) and value is not None
+            for encoded in _query_values(value)
+        ]
+
+    async def _transcribe(self, audio: bytes) -> dict:
+        """POST an audio segment to the pre-recorded API and return the result.
+
+        A request that fails on a dropped connection is sent once more.
+        Deepgram closes an idle connection after about 5 s, so a request sent
+        on a pooled connection as it closes can fail. aiohttp retries such a
+        request itself only for idempotent methods (RFC 9112, section 9.3.1),
+        which excludes POST; repeating this POST only transcribes the segment
+        again, so it is retried here the same way. A failure to connect at all
+        is not retried.
+
+        Args:
+            audio: Audio bytes in WAV format.
+
+        Returns:
+            The decoded JSON transcription result.
+
+        Raises:
+            aiohttp.ClientResponseError: If the API returns a non-200 status.
+        """
+        try:
+            return await self._post_segment(audio)
+        except aiohttp.ClientConnectorError:
+            raise
+        except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
+            logger.debug(f"{self}: connection dropped ({e}), retrying the segment")
+            return await self._post_segment(audio)
+
+    async def _post_segment(self, audio: bytes) -> dict:
+        """Send one request for an audio segment and return the decoded result."""
+        headers = {"Authorization": f"Token {self._api_key}", "Content-Type": "audio/wav"}
+        async with self._session.post(
+            f"{self._base_url}/v1/listen",
+            params=self._query_params(),
+            data=audio,
+            headers=headers,
+        ) as response:
+            if response.status != 200:
+                # The status rides on the exception so the framework can
+                # classify the failure: a rejected key or setting leaves the
+                # service unusable, a rate limit or a server error does not.
+                raise aiohttp.ClientResponseError(
+                    response.request_info,
+                    response.history,
+                    status=response.status,
+                    message=await self._error_detail(response),
+                )
+            return await response.json()
+
+    async def _error_detail(self, response: aiohttp.ClientResponse) -> str:
+        """Build a readable message from a non-200 response.
+
+        Deepgram reports errors as ``{"err_code", "err_msg", "request_id"}``;
+        any other body is returned as is.
+        """
+        try:
+            body = await response.json(content_type=None)
+        except Exception:
+            body = None
+        if isinstance(body, dict) and (body.get("err_code") or body.get("err_msg")):
+            detail = " - ".join(
+                part for part in (body.get("err_code"), body.get("err_msg")) if part
+            )
+            if body.get("request_id"):
+                detail += f" (request_id: {body['request_id']})"
+            return detail
+        return await response.text()
+
+    def _result_language(self, channel: dict, alternative: dict) -> Language | None:
+        """The language of a result: the one Deepgram detected, else the setting.
+
+        A code that isn't a :class:`Language` (and the setting, which holds
+        Deepgram's code) is returned as the raw string; Language is a StrEnum,
+        so downstream handles either.
+        """
+        detected = channel.get("detected_language") or next(
+            iter(alternative.get("languages") or []), None
+        )
+        if not detected:
+            return cast("Language | None", assert_given(self._settings.language))
+        try:
+            return Language(detected)
+        except ValueError:
+            return cast("Language", detected)
+
+    @traced_stt
+    async def _handle_transcription(
+        self, transcript: str, is_final: bool, language: Language | None = None
+    ):
+        """Handle a transcription result with tracing."""
+        pass
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        """Transcribe an audio segment using Deepgram's pre-recorded API.
+
+        Args:
+            audio: Audio bytes in WAV format (already converted by the base
+                class).
+
+        Yields:
+            Frame: A TranscriptionFrame with the transcribed text, or an
+            ErrorFrame on failure. Only non-empty transcriptions are yielded.
+        """
+        try:
+            await self.start_processing_metrics()
+            result = await self._transcribe(audio)
+            await self.stop_processing_metrics()
+
+            # Audio with no samples comes back with no channels at all.
+            channels = result.get("results", {}).get("channels") or []
+            alternatives = channels[0].get("alternatives") or [] if channels else []
+            if not alternatives:
+                return
+
+            alternative = alternatives[0]
+            text = (alternative.get("transcript") or "").strip()
+            if not text:
+                return
+
+            language = self._result_language(channels[0], alternative)
+            await self._handle_transcription(text, True, language)
+            logger.debug(f"Transcription: [{text}]")
+
+            words = None
+            if self._settings.diarize:
+                # Words carry punctuation only when punctuate or smart_format is on.
+                words = [
+                    (word.get("punctuated_word") or word.get("word", ""), word.get("speaker"))
+                    for word in alternative.get("words") or []
+                ]
+            timestamp = time_now_iso8601()
+            for speaker, run_text in self._diarized_runs(text, words):
+                yield TranscriptionFrame(
+                    run_text,
+                    self._user_id,
+                    timestamp,
+                    language,
+                    result=result,
+                    speaker=speaker,
+                )
+        except aiohttp.ClientResponseError as e:
+            # Its str() appends the request URL, whose query carries settings
+            # such as keyterms; the message already names Deepgram's error.
+            yield ErrorFrame(
+                error=f"{self} transcription error: {e.status} {e.message}", exception=e
+            )
+        except TimeoutError as e:
+            # A connection timeout's str() is the request URL, query included,
+            # and the total timeout's is empty; the type says which one it was.
+            yield ErrorFrame(error=f"{self} transcription error: {type(e).__name__}", exception=e)
+        except Exception as e:
+            yield ErrorFrame(error=f"{self} transcription error: {e}", exception=e)

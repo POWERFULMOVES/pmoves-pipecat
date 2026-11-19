@@ -53,9 +53,7 @@ class SentryMetrics(FrameProcessorMetrics):
         await super().setup(task_manager)
         if self._sentry_available:
             self._sentry_queue = asyncio.Queue()
-            self._sentry_task = self.task_manager.create_task(
-                self._sentry_task_handler(), name=f"{self}::_sentry_task_handler"
-            )
+            self._sentry_task = self.create_task(self._sentry_task_handler())
 
     async def cleanup(self):
         """Clean up Sentry resources and flush pending transactions.
@@ -79,11 +77,14 @@ class SentryMetrics(FrameProcessorMetrics):
             start_time: Optional start timestamp override.
             report_only_initial_ttfb: Whether to report only the initial TTFB measurement.
         """
+        # The base class clears this flag once the initial TTFB is measured, so
+        # read it first.
+        should_report_ttfb = self._should_report_ttfb
         await super().start_ttfb_metrics(
             start_time=start_time, report_only_initial_ttfb=report_only_initial_ttfb
         )
 
-        if self._should_report_ttfb and self._sentry_available:
+        if should_report_ttfb and self._sentry_available:
             self._ttfb_metrics_tx = sentry_sdk.start_transaction(
                 op="ttfb",
                 name=f"TTFB for {self._processor_name()}",

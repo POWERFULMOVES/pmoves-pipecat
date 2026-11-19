@@ -17,64 +17,58 @@ service-specific adapter.
 import asyncio
 import base64
 import copy
-import io
-import wave
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypeAlias, TypeGuard, TypeVar, cast, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    TypeAlias,
+    cast,
+    overload,
+)
 
 from loguru import logger
-from openai._types import NOT_GIVEN as OPEN_AI_NOT_GIVEN
-from openai._types import NotGiven as OpenAINotGiven
-from openai.types.chat import (
-    ChatCompletionMessageParam,
-    ChatCompletionToolChoiceOptionParam,
-)
-from PIL import Image
 
-from pipecat.adapters.schemas.direct_function import DirectFunction
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.frames.frames import AudioRawFrame
+from pipecat.adapters.llm.schemas.direct_function import DirectFunction
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
+from pipecat.audio.utils import pcm_to_wav
+from pipecat.frames.frames import AudioRawFrame, FileSourceType
+from pipecat.utils.image import encode_image
+
+# The sentinel is part of LLMContext's public surface — tools and tool_choice
+# default to it — so it is re-exported here for callers. The redundant aliases
+# mark that intent; a plain import would look unused and be stripped.
+from pipecat.utils.types import NOT_GIVEN as NOT_GIVEN
+from pipecat.utils.types import NotGiven as NotGiven
+from pipecat.utils.types import is_given as is_given
 
 # "Re-export" types from OpenAI that we're using as universal context types.
-# NOTE: these are aliased to OpenAI's today, but callers should treat them as
-# LLMContext's own types — independent definitions that happen to coincide
-# with OpenAI's as an implementation detail. If universal context types need
-# to someday diverge from OpenAI's, we should consider managing our own
+# NOTE: these are aliased to OpenAI's for type checking, but callers should
+# treat them as LLMContext's own types — independent definitions that happen to
+# coincide with OpenAI's as an implementation detail. If universal context types
+# need to someday diverge from OpenAI's, we should consider managing our own
 # definitions (but with care, since OpenAI's types are somewhat of a standard
 # and we want to continue supporting them). In the meantime, code at the
 # LLMContext/OpenAI boundary should use explicit casts rather than rely on
 # the aliasing.
-LLMStandardMessage: TypeAlias = ChatCompletionMessageParam
-LLMContextToolChoice: TypeAlias = ChatCompletionToolChoiceOptionParam
-NOT_GIVEN = OPEN_AI_NOT_GIVEN
-NotGiven: TypeAlias = OpenAINotGiven
+#
+# The aliases resolve under type checking only. Every LLM service reaches this
+# module, so importing the OpenAI SDK here would put its load on the startup
+# path of pipelines that never talk to OpenAI. At runtime both are structurally
+# dicts or strings, which is all the annotations need them to be.
+if TYPE_CHECKING:
+    from openai.types.chat import (
+        ChatCompletionMessageParam,
+        ChatCompletionToolChoiceOptionParam,
+    )
 
-
-_T = TypeVar("_T")
-
-
-def is_given(value: _T | NotGiven) -> TypeGuard[_T]:
-    """Check whether a value was explicitly provided.
-
-    Typically used when checking whether a ``NotGiven``-valued field or
-    parameter was set::
-
-        if is_given(context.tools):
-            ...
-
-    Also acts as a type guard: inside a true branch, the value is narrowed
-    to exclude ``NotGiven`` (e.g. ``ToolsSchema | NotGiven`` becomes
-    ``ToolsSchema``).
-
-    Args:
-        value: The value to check.
-
-    Returns:
-        ``True`` if *value* is anything other than ``NOT_GIVEN``.
-    """
-    return not isinstance(value, NotGiven)
+    LLMStandardMessage: TypeAlias = ChatCompletionMessageParam
+    LLMContextToolChoice: TypeAlias = ChatCompletionToolChoiceOptionParam
+else:
+    LLMStandardMessage: TypeAlias = Any
+    LLMContextToolChoice: TypeAlias = Any
 
 
 @dataclass
@@ -90,6 +84,30 @@ class LLMSpecificMessage:
 
 
 LLMContextMessage: TypeAlias = LLMStandardMessage | LLMSpecificMessage
+
+
+def standard_message_text(message: LLMContextMessage) -> str:
+    """Return the text of a standard context message, joining the text parts of list content.
+
+    Args:
+        message: A context message.
+
+    Returns:
+        The text, or ``""`` for a message in a service's own format or one
+        that carries no text.
+    """
+    if isinstance(message, LLMSpecificMessage):
+        return ""
+    content = message.get("content")  # type: ignore[attr-defined]
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        )
+    return ""
 
 
 class LLMContext:
@@ -137,6 +155,9 @@ class LLMContext:
             url: The URL of the image.
             text: Optional text to include with the image.
         """
+        # TODO: Deprecate support for a non-data `url` here now that `create_file_url_message`
+        #       exists — a URL-referenced image and a URL-referenced file should go through the
+        #       same path instead of two.
         content: list[dict[str, Any]] = []
         if text:
             content.append({"type": "text", "text": text})
@@ -164,25 +185,76 @@ class LLMContext:
             image: Raw image bytes.
             text: Optional text to include with the image.
         """
-        # Format is a mime type: image is already encoded
-        image_already_encoded = format.startswith("image/")
+        data, content_type = await encode_image(image, size, format)
+        encoded_image = base64.b64encode(data).decode("utf-8")
 
-        def encode_image():
-            if image_already_encoded:
-                bytes = image
-            else:
-                # Encode to JPEG
-                buffer = io.BytesIO()
-                Image.frombytes(format, size, image).save(buffer, format="JPEG")
-                bytes = buffer.getvalue()
-            encoded_image = base64.b64encode(bytes).decode("utf-8")
-            return encoded_image
-
-        encoded_image = await asyncio.to_thread(encode_image)
-
-        url = f"data:{format if image_already_encoded else 'image/jpeg'};base64,{encoded_image}"
+        url = f"data:{content_type};base64,{encoded_image}"
 
         return LLMContext.create_image_url_message(role=role, url=url, text=text)
+
+    @staticmethod
+    async def create_file_message(
+        *,
+        role: str = "user",
+        type: FileSourceType,
+        format: str,
+        file: str,
+        name: str | None = None,
+        text: str | None = None,
+    ) -> LLMContextMessage:
+        """Create a context message containing a file.
+
+        Args:
+            role: The role of this message (defaults to "user").
+            type: The type of the file.
+            format: MIME type of the file (e.g., "application/pdf").
+            file: Base64 data URL (``data:<mime>;base64,...``) or plain URL string.
+            name: Optional name of the file.
+            text: Optional text to include with the file.
+        """
+        # The URL is stored unresolved; at completion time the LLM service
+        # either passes it to the provider to fetch itself or downloads it via
+        # its FileResolver, depending on what the provider can consume.
+        if type == "url":
+            return LLMContext.create_file_url_message(
+                role=role, format=format, url=file, filename=name, text=text
+            )
+
+        content: list[dict[str, Any]] = []
+        if text:
+            content.append({"type": "text", "text": text})
+
+        file_m = {"file_data": file, "filename": name if name else "", "mime_type": format}
+        content.append({"type": "file_base64", "file": file_m})
+
+        return cast(LLMContextMessage, {"role": role, "content": content})
+
+    @staticmethod
+    def create_file_url_message(
+        *,
+        role: str = "user",
+        format: str,
+        url: str,
+        filename: str | None = None,
+        text: str | None = None,
+    ) -> LLMContextMessage:
+        """Create a context message containing a image or file URL.
+
+        Args:
+            role: The role of this message (defaults to "user").
+            format: The MIME type of the file (e.g., 'application/pdf').
+            url: The URL of the image or file.
+            filename: Optional name of the file.
+            text: Optional text to include with the image or file.
+        """
+        content: list[dict[str, Any]] = []
+        if text:
+            content.append({"type": "text", "text": text})
+
+        file_m = {"url": url, "filename": filename if filename else "", "mime_type": format}
+        content.append({"type": "file_url", "file": file_m})
+
+        return cast(LLMContextMessage, {"role": role, "content": content})
 
     @staticmethod
     async def create_audio_message(
@@ -203,15 +275,8 @@ class LLMContext:
 
             data = b"".join(frame.audio for frame in audio_frames)
 
-            with io.BytesIO() as buffer:
-                with wave.open(buffer, "wb") as wf:
-                    wf.setsampwidth(2)
-                    wf.setnchannels(num_channels)
-                    wf.setframerate(sample_rate)
-                    wf.writeframes(data)
-
-                encoded_audio = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            return encoded_audio
+            wav = pcm_to_wav(data, sample_rate, num_channels)
+            return base64.b64encode(wav).decode("utf-8")
 
         encoded_audio = await asyncio.to_thread(encode_audio)
 
@@ -323,6 +388,10 @@ class LLMContext:
                     elif item_type == "audio":
                         if "audio" in item:
                             item["audio"] = "..."
+                    elif item_type == "file_base64":
+                        if "file" in item:
+                            item["file"]["file_data"] = "..."
+                            item["file"].pop("_raw_bytes", None)
 
             if msg.get("mime_type", "").startswith("image/"):
                 msg["data"] = "..."
@@ -456,6 +525,33 @@ class LLMContext:
         )
         self.add_message(message)
 
+    async def add_file_frame_message(
+        self,
+        *,
+        type: FileSourceType,
+        format: str,
+        file: str,
+        text: str | None = None,
+        name: str | None = None,
+        role: str = "user",
+    ):
+        """Add a message containing a file frame.
+
+        Args:
+            type: File source type.
+            format: MIME type of the file (e.g., 'application/pdf').
+            file: Base64 data URL (``data:<mime>;base64,...``) or plain URL string.
+                URL fetching for providers that require bytes is handled by the
+                provider adapter during message conversion.
+            text: Optional text to accompany the file.
+            name: Optional file name.
+            role: Message role (defaults to 'user').
+        """
+        message = await LLMContext.create_file_message(
+            role=role, type=type, format=format, file=file, name=name, text=text
+        )
+        self.add_message(message)
+
     async def add_audio_frames_message(
         self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
     ):
@@ -468,10 +564,68 @@ class LLMContext:
         message = await LLMContext.create_audio_message(audio_frames=audio_frames, text=text)
         self.add_message(message)
 
+    def remove_invalid_file_message(self) -> bool:
+        """Remove the oldest file or image message added since the model's last successful reply.
+
+        Best-effort cleanup for an LLM service to call once it's determined
+        (from a provider-specific error) that a request was rejected due to
+        unsupported or malformed file content — e.g. an unsupported MIME type,
+        corrupt bytes, or an image whose bytes don't match its declared media
+        type. Removing it prevents the context from getting permanently stuck
+        retrying the same failure. Images count as files here: both are
+        discrete client-supplied attachments a provider can reject the same
+        way. Audio content deliberately doesn't — audio-in-context flows
+        append audio as ordinary conversation every turn, so removing the
+        oldest audio message on an unrelated rejection would discard real
+        conversation rather than a bad attachment.
+
+        Providers don't say which message or content item triggered the
+        rejection, so there's no way to identify the exact culprit — this is
+        a heuristic, not a precise fix. An assistant message proves
+        everything before it was already accepted by a prior successful
+        completion (assistant messages are only ever appended after a
+        completion succeeds), so only file messages added since the last one
+        are candidates — a file from an earlier, already-successful turn is
+        never at risk. If several files are candidates (e.g. sent in quick
+        succession before either went through a completion), only the oldest
+        is removed: if it wasn't the actual culprit, the next retry fails
+        again and removes the next-oldest, converging on the bad file within
+        a few retries without ever knowing which one the provider meant.
+
+        Returns:
+            True if a file or image message was found and removed.
+        """
+        since_index = 0
+        for i in range(len(self._messages) - 1, -1, -1):
+            message = self._messages[i]
+            if not isinstance(message, LLMSpecificMessage) and message.get("role") == "assistant":
+                since_index = i + 1
+                break
+
+        for i in range(since_index, len(self._messages)):
+            message = self._messages[i]
+            if isinstance(message, LLMSpecificMessage):
+                continue
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(item, dict)
+                and item.get("type") in ("file_base64", "file_url", "image_url")
+                for item in content
+            ):
+                logger.warning(
+                    "Removing message with file or image content from context due to "
+                    "invalid response."
+                )
+                self._messages.pop(i)
+                return True
+        return False
+
     @overload
     @staticmethod
     def _normalize_and_validate_tools(
         tools: ToolsSchema | list[FunctionSchema | DirectFunction] | NotGiven,
+        *,
+        allow_provider_tools: Literal[False] = False,
     ) -> ToolsSchema | NotGiven: ...
 
     @overload
@@ -479,7 +633,7 @@ class LLMContext:
     def _normalize_and_validate_tools(
         tools: ToolsSchema | list[Any] | NotGiven,
         *,
-        allow_provider_tools: bool,
+        allow_provider_tools: Literal[True],
     ) -> ToolsSchema | list[Any] | NotGiven: ...
 
     @staticmethod

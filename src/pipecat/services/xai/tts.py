@@ -30,14 +30,15 @@ from websockets.protocol import State
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
-    StartFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, TTSSettings, _NotGiven, assert_given
+from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.services.settings import TTSSettings
 from pipecat.services.tts_service import TTSService, WebsocketTTSService
 from pipecat.transcriptions.language import Language, resolve_language
 from pipecat.utils.tracing.service_decorators import traced_tts
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 
 def language_to_xai_language(language: Language) -> str:
@@ -139,11 +140,22 @@ class XAITTSSettings(TTSSettings):
         speed: Speech speed multiplier from 0.7 to 1.5 (1.0 is normal).
         optimize_streaming_latency: Latency optimization level (0, 1, or 2).
         text_normalization: Whether to normalize text before synthesis.
+        replace: Map of phrases to spoken substitutions applied before
+            synthesis, e.g. ``{"Acme Mobile": "Acme Mobull"}``. Values are
+            respellings or IPA phonetics in forward slashes. Up to 200 entries.
+
+            Another way to guide pronunciation is to pass
+            :func:`~pipecat.utils.text.transforms.replace_text` find-and-replace rules
+            through the ``text_transforms`` parameter. Pipecat applies them before the
+            text reaches the provider, so the same rules can work across TTS services
+            and depend less on what each provider supports. They're worth trying if this
+            setting isn't giving you the results you want.
     """
 
-    speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    optimize_streaming_latency: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    text_normalization: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speed: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    optimize_streaming_latency: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    text_normalization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    replace: dict[str, str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class XAIHttpTTSService(TTSService):
@@ -185,6 +197,7 @@ class XAIHttpTTSService(TTSService):
             speed=None,
             optimize_streaming_latency=None,
             text_normalization=None,
+            replace=None,
         )
 
         if settings is not None:
@@ -270,6 +283,8 @@ class XAIHttpTTSService(TTSService):
             payload["optimize_streaming_latency"] = self._settings.optimize_streaming_latency
         if assert_given(self._settings.text_normalization) is not None:
             payload["text_normalization"] = self._settings.text_normalization
+        if assert_given(self._settings.replace) is not None:
+            payload["replace"] = self._settings.replace
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -313,10 +328,10 @@ class XAIWebsocketTTSSettings(TTSSettings):
             service converts them into per-word ``TTSTextFrame`` objects.
     """
 
-    speed: float | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    optimize_streaming_latency: int | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    text_normalization: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    with_timestamps: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speed: float | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    optimize_streaming_latency: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    text_normalization: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    with_timestamps: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class XAITTSService(WebsocketTTSService):
@@ -417,9 +432,13 @@ class XAITTSService(WebsocketTTSService):
         """Convert a Language enum to xAI language format."""
         return language_to_xai_language(language)
 
-    async def start(self, frame: StartFrame):
-        """Start the xAI WebSocket TTS service."""
-        await super().start(frame)
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
+
+        Args:
+            setup: Configuration object containing setup parameters.
+        """
+        await super().setup(setup)
         await self._connect()
 
     async def _connect(self):

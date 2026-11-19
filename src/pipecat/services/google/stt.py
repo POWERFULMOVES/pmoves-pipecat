@@ -4,18 +4,17 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Google Cloud Speech-to-Text V2 service implementation for Pipecat.
+"""Google speech-to-text service implementations for Pipecat.
 
-This module provides a Google Cloud Speech-to-Text V2 service with streaming
-support, enabling real-time speech recognition with features like automatic
-punctuation, voice activity detection, and multi-language support.
+``GoogleSTTService`` provides Google Cloud Speech-to-Text V2, with features
+like automatic punctuation, voice activity detection, and multi-language
+support.
 """
 
 import asyncio
 import json
 import os
 import time
-import warnings
 from dataclasses import dataclass, field
 
 from pipecat.utils.tracing.service_decorators import traced_stt
@@ -24,7 +23,7 @@ from pipecat.utils.tracing.service_decorators import traced_stt
 os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, cast
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,15 +33,16 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InterimTranscriptionFrame,
-    StartFrame,
     TranscriptionFrame,
 )
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given, is_given
+from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_latency import GOOGLE_TTFS_P99
 from pipecat.services.stt_service import STTService
 from pipecat.transcriptions.language import Language, resolve_language
-from pipecat.utils.deprecation import deprecated
+from pipecat.utils.deprecation import deprecated, warn_deprecated
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 try:
     from google.api_core.client_options import ClientOptions
@@ -467,22 +467,31 @@ class GoogleSTTSettings(STTSettings):
             service. The telephony model rejects adaptation and transcribes
             without it; support otherwise varies by model and language — see
             https://cloud.google.com/speech-to-text/v2/docs/speech-to-text-supported-languages
+
+        denoiser_config: Background-noise removal, as a ``DenoiserConfig``
+            message or an equivalent dict::
+
+                denoiser_config={"denoise_audio": True}
+
+            Only the Chirp 3 models denoise; see
+            https://cloud.google.com/speech-to-text/docs/models/chirp-3
     """
 
-    languages: list[Language] | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    language_codes: list[str] | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    use_separate_recognition_per_channel: bool | _NotGiven = field(
+    languages: list[Language] | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    language_codes: list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    use_separate_recognition_per_channel: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_automatic_punctuation: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_spoken_punctuation: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_spoken_emojis: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    profanity_filter: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_word_time_offsets: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_word_confidence: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_interim_results: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    enable_voice_activity_events: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    adaptation: dict[str, Any] | cloud_speech.SpeechAdaptation | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
-    enable_automatic_punctuation: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_spoken_punctuation: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_spoken_emojis: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    profanity_filter: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_word_time_offsets: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_word_confidence: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_interim_results: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    enable_voice_activity_events: bool | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
-    adaptation: dict[str, Any] | cloud_speech.SpeechAdaptation | None | _NotGiven = field(
+    denoiser_config: dict[str, Any] | cloud_speech.DenoiserConfig | None | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -625,6 +634,7 @@ class GoogleSTTService(STTService):
             enable_interim_results=True,
             enable_voice_activity_events=False,
             adaptation=None,
+            denoiser_config=None,
         )
 
         # 2. No direct init arg overrides
@@ -635,17 +645,23 @@ class GoogleSTTService(STTService):
             if not settings:
                 default_settings.languages = list(params.language_list)
                 default_settings.model = params.model
-                default_settings.use_separate_recognition_per_channel = (
+                # The deprecated params type their flags as optional, and Google
+                # reads an unset flag as False, so that is what None becomes.
+                default_settings.use_separate_recognition_per_channel = bool(
                     params.use_separate_recognition_per_channel
                 )
-                default_settings.enable_automatic_punctuation = params.enable_automatic_punctuation
-                default_settings.enable_spoken_punctuation = params.enable_spoken_punctuation
-                default_settings.enable_spoken_emojis = params.enable_spoken_emojis
-                default_settings.profanity_filter = params.profanity_filter
-                default_settings.enable_word_time_offsets = params.enable_word_time_offsets
-                default_settings.enable_word_confidence = params.enable_word_confidence
-                default_settings.enable_interim_results = params.enable_interim_results
-                default_settings.enable_voice_activity_events = params.enable_voice_activity_events
+                default_settings.enable_automatic_punctuation = bool(
+                    params.enable_automatic_punctuation
+                )
+                default_settings.enable_spoken_punctuation = bool(params.enable_spoken_punctuation)
+                default_settings.enable_spoken_emojis = bool(params.enable_spoken_emojis)
+                default_settings.profanity_filter = bool(params.profanity_filter)
+                default_settings.enable_word_time_offsets = bool(params.enable_word_time_offsets)
+                default_settings.enable_word_confidence = bool(params.enable_word_confidence)
+                default_settings.enable_interim_results = bool(params.enable_interim_results)
+                default_settings.enable_voice_activity_events = bool(
+                    params.enable_voice_activity_events
+                )
                 default_settings.adaptation = params.adaptation
 
         # 4. Apply settings delta (canonical API, always wins)
@@ -691,7 +707,7 @@ class GoogleSTTService(STTService):
             self._project_id = json_account_info.get("project_id")
             creds = service_account.Credentials.from_service_account_info(json_account_info)
         elif credentials_path:
-            with open(credentials_path) as f:
+            with open(credentials_path, encoding="utf-8") as f:
                 json_account_info = json.load(f)
                 self._project_id = json_account_info.get("project_id")
             creds = service_account.Credentials.from_service_account_file(credentials_path)
@@ -761,6 +777,15 @@ class GoogleSTTService(STTService):
         # Already a message: normalizing on the way in leaves nothing to convert.
         return _normalize_speech_adaptation(adaptation)
 
+    def _get_denoiser_config(self) -> cloud_speech.DenoiserConfig | None:
+        """Build the DenoiserConfig message from settings."""
+        denoiser_config = self._settings.denoiser_config
+        if not is_given(denoiser_config) or denoiser_config is None:
+            return None
+        if isinstance(denoiser_config, cloud_speech.DenoiserConfig):
+            return denoiser_config
+        return cloud_speech.DenoiserConfig(denoiser_config)
+
     async def _reconnect_if_needed(self):
         """Reconnect the stream if it's currently active."""
         if self._streaming_task:
@@ -801,20 +826,18 @@ class GoogleSTTService(STTService):
         """
         # If base set_language sent a Language value, convert to languages list
         if is_given(delta.language):
-            delta.languages = [delta.language]
+            delta.languages = [cast(Language, delta.language)]
             # Clear language so the base class doesn't try to store it
             delta.language = NOT_GIVEN
 
         # Warn on deprecated language_codes usage
         if is_given(delta.language_codes):
-            with warnings.catch_warnings():
-                warnings.simplefilter("always")
-                warnings.warn(
-                    "self.Settings.language_codes is deprecated. "
-                    "Use self.Settings.languages (List[Language]) instead.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
+            warn_deprecated(
+                "`GoogleSTTService.Settings.language_codes` is deprecated since 0.0.104 and "
+                "will be removed in 2.0.0. Use `GoogleSTTService.Settings.languages` "
+                "(`list[Language]`) instead.",
+                stacklevel=2,
+            )
 
         if is_given(delta.adaptation) and delta.adaptation is not None:
             delta.adaptation = _normalize_speech_adaptation(delta.adaptation)
@@ -826,14 +849,19 @@ class GoogleSTTService(STTService):
 
         return changed
 
-    async def start(self, frame: StartFrame):
-        """Start the STT service and establish connection.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
 
         Args:
-            frame: The start frame triggering the service start.
+            setup: Configuration object containing setup parameters.
         """
-        await super().start(frame)
+        await super().setup(setup)
         await self._connect()
+
+    async def cleanup(self):
+        """Release streaming resources."""
+        await super().cleanup()
+        await self._disconnect()
 
     async def stop(self, frame: EndFrame):
         """Stop the STT service and clean up resources.
@@ -853,11 +881,6 @@ class GoogleSTTService(STTService):
         await super().cancel(frame)
         await self._disconnect()
 
-    async def cleanup(self):
-        """Release streaming resources."""
-        await super().cleanup()
-        await self._disconnect()
-
     @deprecated(
         "`GoogleSTTService.update_options` is deprecated since 0.0.104 and will be removed in "
         "2.0.0. Use `STTUpdateSettingsFrame` instead."
@@ -875,7 +898,7 @@ class GoogleSTTService(STTService):
         enable_word_confidence: bool | None = None,
         enable_interim_results: bool | None = None,
         enable_voice_activity_events: bool | None = None,
-        adaptation: dict[str, Any] | cloud_speech.SpeechAdaptation | None | _NotGiven = NOT_GIVEN,
+        adaptation: dict[str, Any] | cloud_speech.SpeechAdaptation | None | NotGiven = NOT_GIVEN,
         location: str | None = None,
     ) -> None:
         """Update service options dynamically.
@@ -960,9 +983,13 @@ class GoogleSTTService(STTService):
             ),
         )
 
+        denoiser_config = self._get_denoiser_config()
+        if denoiser_config is not None:
+            recognition_config.denoiser_config = denoiser_config
+
         speech_adaptation = self._get_speech_adaptation()
         if speech_adaptation is not None:
-            if _model_supports_adaptation(self._settings.model):
+            if _model_supports_adaptation(assert_given(self._settings.model)):
                 recognition_config.adaptation = speech_adaptation
             else:
                 logger.warning(
@@ -1074,7 +1101,6 @@ class GoogleSTTService(STTService):
         """
         if self._streaming_task:
             # Queue the audio data
-            await self.start_processing_metrics()
             await self._request_queue.put(audio)
         yield None
 
@@ -1088,11 +1114,6 @@ class GoogleSTTService(STTService):
         """Process streaming recognition responses."""
         try:
             async for response in streaming_recognize:
-                # Check streaming limit
-                if (int(time.time() * 1000) - self._stream_start_time) > self.STREAMING_LIMIT:
-                    logger.debug("Stream timeout reached in response processing")
-                    break
-
                 if not response.results:
                     continue
 
@@ -1104,7 +1125,8 @@ class GoogleSTTService(STTService):
                     if not transcript:
                         continue
 
-                    primary_language = self._get_language_codes()[0]
+                    # Google's language codes are the values Language is built from.
+                    primary_language = cast(Language, self._get_language_codes()[0])
 
                     if result.is_final:
                         self._last_transcript_was_final = True
@@ -1122,7 +1144,6 @@ class GoogleSTTService(STTService):
                                 finalized=True,
                             )
                         )
-                        await self.stop_processing_metrics()
                         await self._handle_transcription(
                             transcript,
                             is_final=True,
@@ -1139,7 +1160,7 @@ class GoogleSTTService(STTService):
                                 result=result,
                             )
                         )
-        except Aborted as e:
+        except Aborted:
             # Handle stream abort due to inactivity (409 error).
             # This occurs when no audio is sent to the stream for 10+ seconds,
             # which can happen when InputAudioRawFrames are blocked.

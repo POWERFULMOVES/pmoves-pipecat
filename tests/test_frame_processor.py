@@ -5,8 +5,11 @@
 #
 
 import asyncio
+import io
 import unittest
 from dataclasses import dataclass, field
+
+from loguru import logger
 
 from pipecat.frames.frames import (
     DataFrame,
@@ -14,10 +17,11 @@ from pipecat.frames.frames import (
     Frame,
     InterruptionFrame,
     OutputTransportMessageUrgentFrame,
+    StartFrame,
     StopFrame,
     SystemFrame,
     TextFrame,
-    UninterruptibleFrame,
+    UserStartedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.processors.filters.identity_filter import IdentityFilter
@@ -26,6 +30,8 @@ from pipecat.processors.frame_processor import (
     FrameProcessor,
 )
 from pipecat.tests.utils import SleepFrame, run_test
+from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 @dataclass
@@ -35,6 +41,30 @@ class BroadcastTestFrame(DataFrame):
     text: str = ""
     value: int = 0
     items: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _CancelInProgressFrame(SystemFrame):
+    """Asks the processor to cancel ``target`` if it is the frame in progress."""
+
+    target: Frame | None = None
+
+
+class _CancelInProgressProcessor(FrameProcessor):
+    """Takes 0.4s over every non-system frame, and records what each cancel request did."""
+
+    def __init__(self):
+        super().__init__()
+        self.cancelled: list[bool] = []
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, _CancelInProgressFrame):
+            assert frame.target is not None
+            self.cancelled.append(await self._cancel_frame_in_progress(frame.target))
+        elif not isinstance(frame, SystemFrame):
+            await asyncio.sleep(0.4)
+        await self.push_frame(frame, direction)
 
 
 class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
@@ -152,8 +182,9 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
 
     async def test_uninterruptible_frames(self):
         @dataclass
-        class TestUninterruptibleFrame(DataFrame, UninterruptibleFrame):
+        class TestUninterruptibleFrame(DataFrame):
             text: str
+            interruptible: bool = field(default=False, init=False)
 
         class DelayTestFrameProcessor(FrameProcessor):
             """This processor just delays processing non-InterruptionFrame so we
@@ -187,6 +218,88 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
             frames_to_send=frames_to_send,
             expected_down_frames=expected_down_frames,
         )
+
+    async def test_cancel_frame_in_progress_keeps_the_queue(self):
+        processor = _CancelInProgressProcessor()
+        in_progress = TextFrame(text="in progress")
+        frames_to_send = [
+            in_progress,
+            SleepFrame(sleep=0.1),
+            TextFrame(text="queued"),
+            _CancelInProgressFrame(target=in_progress),
+        ]
+        down, _ = await run_test(
+            processor,
+            frames_to_send=frames_to_send,
+            expected_down_frames=[_CancelInProgressFrame, TextFrame],
+        )
+        self.assertEqual(processor.cancelled, [True])
+        self.assertEqual(down[-1].text, "queued")
+
+    async def test_cancel_frame_in_progress_leaves_other_frames_alone(self):
+        processor = _CancelInProgressProcessor()
+        queued = TextFrame(text="queued")
+        frames_to_send = [
+            TextFrame(text="in progress"),
+            SleepFrame(sleep=0.1),
+            queued,
+            _CancelInProgressFrame(target=queued),
+        ]
+        down, _ = await run_test(
+            processor,
+            frames_to_send=frames_to_send,
+            expected_down_frames=[_CancelInProgressFrame, TextFrame, TextFrame],
+        )
+        self.assertEqual(processor.cancelled, [False])
+        self.assertEqual([f.text for f in down[1:]], ["in progress", "queued"])
+
+    async def test_an_interruption_after_cancel_frame_in_progress_still_interrupts(self):
+        processor = _CancelInProgressProcessor()
+        in_progress = TextFrame(text="in progress")
+        frames_to_send = [
+            in_progress,
+            SleepFrame(sleep=0.1),
+            _CancelInProgressFrame(target=in_progress),
+            TextFrame(text="next"),
+            SleepFrame(sleep=0.1),
+            InterruptionFrame(),
+        ]
+        await run_test(
+            processor,
+            frames_to_send=frames_to_send,
+            expected_down_frames=[_CancelInProgressFrame, InterruptionFrame],
+        )
+        self.assertEqual(processor.cancelled, [True])
+
+    async def test_interruptible_flag_decides_for_a_frame(self):
+        """A plain frame marked uninterruptible survives, a marker frame marked interruptible does not."""
+
+        @dataclass
+        class MarkerFrame(DataFrame):
+            text: str
+            interruptible: bool = field(default=False, init=False)
+
+        class DelayTestFrameProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if not isinstance(frame, SystemFrame):
+                    await asyncio.sleep(0.4)
+                await self.push_frame(frame, direction)
+
+        kept = TextFrame(text="kept")
+        kept.interruptible = False
+        dropped = MarkerFrame(text="dropped")
+        dropped.interruptible = True
+
+        pipeline = Pipeline([DelayTestFrameProcessor()])
+        frames_to_send = [kept, dropped, SleepFrame(), InterruptionFrame()]
+        expected_down_frames = [InterruptionFrame, TextFrame]
+        received, _ = await run_test(
+            pipeline,
+            frames_to_send=frames_to_send,
+            expected_down_frames=expected_down_frames,
+        )
+        self.assertEqual([f.text for f in received if isinstance(f, TextFrame)], ["kept"])
 
     async def test_broadcast_frame(self):
         """Test that broadcast_frame creates two separate frames with fresh IDs."""
@@ -472,6 +585,203 @@ class TestFrameProcessor(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=expected_down_frames,
         )
         self.assertTrue(code_after_ran, "Code after broadcast_interruption() should execute")
+
+    async def test_pause_frames_until_holds_then_delivers_in_order(self):
+        """Frames arriving before the condition is met are delivered once it is."""
+        ready = asyncio.Event()
+        received = []
+
+        class HoldingProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, StartFrame):
+                    await self.pause_processing_all_frames_until(ready.wait)
+                elif isinstance(frame, TextFrame):
+                    received.append(frame.text)
+                await self.push_frame(frame, direction)
+
+        async def release_later():
+            await asyncio.sleep(0.2)
+            self.assertEqual(received, [], "frames should be held while not ready")
+            ready.set()
+
+        release = asyncio.create_task(release_later())
+        await run_test(
+            HoldingProcessor(),
+            frames_to_send=[TextFrame(text="a"), TextFrame(text="b"), SleepFrame(sleep=0.4)],
+            expected_down_frames=[TextFrame, TextFrame],
+        )
+        await release
+
+        self.assertEqual(received, ["a", "b"])
+
+    async def test_pause_frames_until_resumes_when_never_ready(self):
+        """A condition that is never met must not leave the processor paused.
+
+        The pause holds both frame queues, so a processor left paused could
+        not process the frames that shut it down.
+        """
+        never = asyncio.Event()
+        received = []
+
+        class HoldingProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, StartFrame):
+                    await self.pause_processing_all_frames_until(never.wait, timeout=0.2)
+                elif isinstance(frame, TextFrame):
+                    received.append(frame.text)
+                await self.push_frame(frame, direction)
+
+        await asyncio.wait_for(
+            run_test(
+                HoldingProcessor(),
+                frames_to_send=[TextFrame(text="a"), SleepFrame(sleep=0.5)],
+                expected_down_frames=[TextFrame],
+            ),
+            timeout=10,
+        )
+
+        self.assertEqual(received, ["a"])
+
+    async def test_pause_frames_until_holds_both_queues(self):
+        """Data frames already routed to the process queue must be held too.
+
+        The two queues pause independently, so frames that have already moved
+        to the process queue keep draining unless it is held as well.
+        """
+        processor = FrameProcessor()
+        processor.create_task = lambda coro, name=None: asyncio.create_task(coro)
+
+        await processor.pause_processing_all_frames_until(asyncio.Event().wait, timeout=5.0)
+
+        self.assertTrue(processor._FrameProcessor__should_block_system_frames)
+        self.assertTrue(processor._FrameProcessor__should_block_frames)
+
+    async def test_pause_frames_until_is_a_no_op_in_direct_mode(self):
+        """Direct mode bypasses the queues the pause acts on, so the call warns."""
+        ready = asyncio.Event()
+        processor = FrameProcessor(enable_direct_mode=True)
+
+        sink = io.StringIO()
+        handler_id = logger.add(sink, format="{message}")
+        try:
+            await processor.pause_processing_all_frames_until(ready.wait)
+            self.assertIn("direct mode", sink.getvalue())
+        finally:
+            logger.remove(handler_id)
+
+    async def test_push_frame_trace_logs(self):
+        """Pushing a frame is logged at the TRACE level in both directions."""
+        first = IdentityFilter()
+        second = IdentityFilter()
+        pipeline = Pipeline([first, second])
+        # Braces in the frame description must be logged as is.
+        down_frame = TextFrame(text="{down}")
+        up_frame = TextFrame(text="{up}")
+
+        sink = io.StringIO()
+        handler_id = logger.add(sink, level="TRACE", format="{message}")
+        try:
+            await run_test(
+                pipeline,
+                frames_to_send=[down_frame],
+                expected_down_frames=[TextFrame],
+            )
+            await run_test(
+                pipeline,
+                frames_to_send=[up_frame],
+                frames_to_send_direction=FrameDirection.UPSTREAM,
+                expected_up_frames=[TextFrame],
+            )
+        finally:
+            logger.remove(handler_id)
+
+        logs = sink.getvalue()
+        self.assertIn(f"Pushing {down_frame} downstream from {first} to {second}", logs)
+        self.assertIn(f"Pushing {up_frame} upstream from {second} to {first}", logs)
+
+    async def test_start_frame_is_processed_first(self):
+        """A processor holds every frame it receives until its StartFrame.
+
+        Processors are set up concurrently, so one that connects during setup
+        can push frames at a processor that has not started yet. Those frames
+        wait, and the StartFrame is processed ahead of them even when what is
+        waiting is itself a system frame.
+        """
+        processed: list[str] = []
+
+        class RecordingProcessor(FrameProcessor):
+            async def process_frame(self, frame: Frame, direction: FrameDirection):
+                await super().process_frame(frame, direction)
+                processed.append(type(frame).__name__)
+
+        processor = RecordingProcessor()
+        await processor.setup(frame_processor_setup(TaskManager()))
+        try:
+            await processor.queue_frame(TextFrame(text="early"))
+            await processor.queue_frame(UserStartedSpeakingFrame())
+
+            await asyncio.sleep(0.1)
+            self.assertEqual(processed, [], "no frame should be processed before the StartFrame")
+
+            await processor.queue_frame(StartFrame())
+            await asyncio.sleep(0.1)
+
+            self.assertEqual(processed, ["StartFrame", "UserStartedSpeakingFrame", "TextFrame"])
+        finally:
+            await processor.cleanup()
+
+
+class TestPushErrorUsability(unittest.IsolatedAsyncioTestCase):
+    """The usability verdict push_error derives from an error's category, and
+    the ways a caller can override it."""
+
+    def _processor(self):
+        from unittest.mock import AsyncMock
+
+        from pipecat.processors.filters.identity_filter import IdentityFilter
+
+        processor = IdentityFilter()
+        processor.push_frame = AsyncMock()
+        return processor
+
+    def _permanent_error(self):
+        """An exception whose HTTP status classifies as a permanent category."""
+
+        class FakeApiError(Exception):
+            status_code = 400
+
+        return FakeApiError("bad request")
+
+    async def test_permanent_category_marks_processor_unusable(self):
+        processor = self._processor()
+        await processor.push_error("bad request", exception=self._permanent_error())
+        self.assertFalse(processor.is_usable)
+        await processor.cleanup()
+
+    async def test_explicit_category_overrides_exception_classification(self):
+        """A caller that knows better can keep the processor usable by passing
+        a non-permanent category — e.g. an LLM service reporting a provider
+        rejection as APPLICATION after removing the rejected context message,
+        where the exception alone would classify as a permanent invalid
+        request."""
+        from pipecat.utils.errors import ErrorCategory
+
+        processor = self._processor()
+        await processor.push_error(
+            "bad request",
+            exception=self._permanent_error(),
+            category=ErrorCategory.APPLICATION,
+        )
+        self.assertTrue(processor.is_usable)
+        await processor.cleanup()
+
+    async def test_force_treat_as_permanent_wins_over_transient_category(self):
+        processor = self._processor()
+        await processor.push_error("kept failing", force_treat_as_permanent=True)
+        self.assertFalse(processor.is_usable)
+        await processor.cleanup()
 
 
 if __name__ == "__main__":

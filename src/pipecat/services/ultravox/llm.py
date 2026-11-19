@@ -25,15 +25,15 @@ from typing_extensions import override
 from websockets.asyncio import client as websocket_client
 from websockets.exceptions import ConnectionClosed
 
-from pipecat.adapters.schemas.direct_function import DirectFunction
-from pipecat.adapters.schemas.function_schema import FunctionSchema
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.llm.schemas.direct_function import DirectFunction
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
 from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import (
-    AggregationType,
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallResultFrame,
     InputAudioRawFrame,
     InputTextRawFrame,
     InterruptionFrame,
@@ -43,6 +43,7 @@ from pipecat.frames.frames import (
     LLMServiceMetadataFrame,
     LLMTextFrame,
     StartFrame,
+    TextType,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -54,9 +55,11 @@ from pipecat.frames.frames import (
 from pipecat.processors.aggregators import async_tool_messages
 from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
 from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import NOT_GIVEN, LLMSettings, _NotGiven, assert_given
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService, LLMWithBackendRole
+from pipecat.services.settings import LLMSettings
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.tracing.service_decorators import traced_realtime_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 # Result shipped as the client_tool_result when we see an async-tool
 # "started" message — i.e. when an async-registered function call
@@ -75,6 +78,12 @@ _ASYNC_TOOL_STARTED_RESULT = (
 # tool-result update rather than fresh user input.
 _ASYNC_TOOL_FINAL_RESULT_TEMPLATE = "[Async tool result for tool_call_id={tool_call_id}] {result}"
 
+# Template for the user-side text we inject when an intermediate result
+# arrives: the same framing as the final one, saying the task is still running.
+_ASYNC_TOOL_PROGRESS_TEMPLATE = (
+    "[Async tool progress for tool_call_id={tool_call_id}, still running] {result}"
+)
+
 
 @dataclass
 class UltravoxRealtimeLLMSettings(LLMSettings):
@@ -84,7 +93,7 @@ class UltravoxRealtimeLLMSettings(LLMSettings):
         output_medium: The output medium for the model ("voice" or "text").
     """
 
-    output_medium: str | None | _NotGiven = field(default=NOT_GIVEN)
+    output_medium: str | None | NotGiven = field(default=NOT_GIVEN)
 
 
 class AgentInputParams(BaseModel):
@@ -127,7 +136,8 @@ class OneShotInputParams(BaseModel):
         api_key: Ultravox API key for authentication.
         system_prompt: System prompt to guide the model's behavior. Defaults to None.
         temperature: Sampling temperature for response generation. Defaults to 0.
-        model: Model identifier to use. Defaults to "fixie-ai/ultravox".
+        model: Model identifier to use, e.g. "ultravox-v0.7". Defaults to None,
+            which lets Ultravox pick its current default model.
         voice: Voice identifier for speech generation. Defaults to None.
         metadata: Metadata to attach to the call. Default to an empty dict.
         output_medium: The initial output medium for the agent. Use "text" for text
@@ -163,6 +173,7 @@ class JoinUrlInputParams(BaseModel):
     join_url: str
 
 
+@traced_realtime_llm
 class UltravoxRealtimeLLMService(LLMService):
     """Provides access to the Ultravox Realtime API.
 
@@ -301,7 +312,7 @@ class UltravoxRealtimeLLMService(LLMService):
             self._socket = await websocket_client.connect(join_url)
             self._receive_task = self.create_task(self._receive_messages())
         except Exception as e:
-            await self.push_error("Failed to connect to Ultravox", e, fatal=True)
+            await self.push_error("Failed to connect to Ultravox", e, force_treat_as_permanent=True)
 
     @staticmethod
     def _output_medium_to_api(medium: Literal["text", "voice"] | None) -> str | None:
@@ -444,6 +455,76 @@ class UltravoxRealtimeLLMService(LLMService):
         """Return the ``one_shot_selected_tools`` configured at construction, if any."""
         return self._selected_tools
 
+    def llm_with_backend_role_objection(self, role: LLMWithBackendRole) -> str | None:
+        """Decline the frontend role: built-in tools never reach an Ultravox session."""
+        if role == "frontend":
+            return (
+                "UltravoxRealtimeLLMService cannot be an LLMWithBackend frontend: built-in "
+                "tools do not reach its session, so its model never sees the delegate tool"
+            )
+        return None
+
+    @property
+    def accepts_intermediate_function_call_results(self) -> bool:
+        """Intermediate results reach the model as user-side text.
+
+        A client tool takes one result, which Ultravox is given as soon as an
+        async call starts so the conversation isn't frozen; what the call
+        produces after that goes in as text (see :meth:`push_frame`).
+        """
+        return True
+
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame, sending function call results to Ultravox on the way.
+
+        Results are broadcast by the base service; the downstream copy is
+        observed here and sent as it is produced, so a tool that reports
+        progress reaches the model while it is still working.
+
+        Args:
+            frame: The frame to push.
+            direction: The direction of frame pushing.
+        """
+        if direction == FrameDirection.DOWNSTREAM and isinstance(frame, FunctionCallResultFrame):
+            await self._handle_function_call_result(frame)
+        await super().push_frame(frame, direction)
+
+    async def _handle_function_call_result(self, frame: FunctionCallResultFrame):
+        """Send one result to Ultravox as it is produced.
+
+        An intermediate result goes in as user-side text, urgent enough to
+        speak about when the result asks the model to run, and as context to
+        draw on otherwise. A final result settles the call — through the tool
+        channel, or as text when the call was already settled with the
+        placeholder that unfreezes an async one.
+        """
+        result = (
+            json.dumps(frame.result, ensure_ascii=False)
+            if frame.result is not None
+            else "COMPLETED"
+        )
+        is_final = frame.properties.is_final if frame.properties else True
+
+        if not is_final:
+            run_llm = frame.properties.run_llm if frame.properties else None
+            if run_llm is None:
+                run_llm = frame.run_llm if frame.run_llm is not None else True
+            await self._send_user_text(
+                _ASYNC_TOOL_PROGRESS_TEMPLATE.format(
+                    tool_call_id=frame.tool_call_id, result=result
+                ),
+                urgency="soon" if run_llm else "later",
+            )
+            return
+
+        if frame.tool_call_id in self._completed_tool_calls:
+            return
+        if frame.tool_call_id in self._started_placeholder_sent:
+            await self._send_async_tool_result(frame.tool_call_id, result)
+        else:
+            await self._send_tool_result(frame.tool_call_id, result)
+            self._completed_tool_calls.add(frame.tool_call_id)
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process incoming frames for the Ultravox Realtime service.
 
@@ -491,31 +572,14 @@ class UltravoxRealtimeLLMService(LLMService):
                     # call. Nothing more to do here.
                     continue
                 if async_payload.kind == "intermediate":
-                    logger.error(
-                        f"{self}: Ultravox does not support streamed async "
-                        f"tool results; dropping intermediate result for "
-                        f"tool_call_id={async_payload.tool_call_id}. Use a "
-                        f"non-realtime LLM service if your tool needs to "
-                        f"stream intermediate results."
-                    )
-                    await self.push_error(
-                        error_msg="Ultravox does not support streamed async tool results.",
-                    )
+                    # Sent as text when it was produced.
                     continue
                 if async_payload.kind == "final":
                     if async_payload.tool_call_id in self._completed_tool_calls:
                         continue
-                    # The placeholder client_tool_result has already
-                    # "completed" the tool call from Ultravox's perspective,
-                    # so the actual result is delivered as user-side text
-                    # (see _ASYNC_TOOL_FINAL_RESULT_TEMPLATE).
-                    await self._send_user_text(
-                        _ASYNC_TOOL_FINAL_RESULT_TEMPLATE.format(
-                            tool_call_id=async_payload.tool_call_id,
-                            result=async_payload.result,
-                        )
+                    await self._send_async_tool_result(
+                        async_payload.tool_call_id, async_payload.result or ""
                     )
-                    self._completed_tool_calls.add(async_payload.tool_call_id)
                     continue
                 # Defensive: any async-tool message must not fall through
                 # to the regular tool-result block below, even if it
@@ -530,10 +594,30 @@ class UltravoxRealtimeLLMService(LLMService):
                     result = (
                         content
                         if isinstance(content, str)
-                        else "".join(t.get("text") for t in content)
+                        else "".join(t.get("text", "") for t in content or [])
                     )
-                    await self._send_tool_result(tool_call_id, result)
-                    self._completed_tool_calls.add(tool_call_id)
+                    if tool_call_id in self._started_placeholder_sent:
+                        # An async call whose result arrived before the
+                        # conversation moved on settles in the context as an
+                        # ordinary tool result, but Ultravox has already been
+                        # given the placeholder for it and ignores a second
+                        # client_tool_result, so the result still has to go
+                        # in as user-side text.
+                        await self._send_async_tool_result(tool_call_id, result)
+                    else:
+                        await self._send_tool_result(tool_call_id, result)
+                        self._completed_tool_calls.add(tool_call_id)
+
+    async def _send_async_tool_result(self, tool_call_id: str, result: str):
+        """Deliver an async tool's actual result as user-side text.
+
+        The placeholder client_tool_result has already completed the call from
+        Ultravox's perspective (see ``_ASYNC_TOOL_FINAL_RESULT_TEMPLATE``).
+        """
+        await self._send_user_text(
+            _ASYNC_TOOL_FINAL_RESULT_TEMPLATE.format(tool_call_id=tool_call_id, result=result)
+        )
+        self._completed_tool_calls.add(tool_call_id)
 
     async def _send_tool_result(self, tool_call_id: str, result: str):
         """Send a tool call result to Ultravox."""
@@ -575,24 +659,33 @@ class UltravoxRealtimeLLMService(LLMService):
             audio = await self._resampler.resample(audio, frame.sample_rate, self._sample_rate)
         await self._send(audio)
 
-    async def _send_user_text(self, text: str):
+    async def _send_user_text(self, text: str, *, urgency: str | None = None):
         """Send user text via Ultravox Realtime.
 
         Args:
             text: The text to send as user input.
+            urgency: When the agent should act on it — ``"soon"`` at the next
+                opportunity, ``"later"`` on a reply it makes anyway, so the
+                text is context rather than something to answer. Ultravox's own
+                default applies when omitted.
         """
         if not self._socket:
             return
-        await self._send({"type": "user_text_message", "text": text})
+        message: dict[str, Any] = {"type": "user_text_message", "text": text}
+        if urgency:
+            message["urgency"] = urgency
+        await self._send(message)
 
-    async def _update_output_medium(self, output_medium: str):
-        output_medium = output_medium.lower()
-        if output_medium == "audio":
-            output_medium = "voice"
-        if output_medium.lower() not in {"voice", "text"}:
+    async def _update_output_medium(self, output_medium: str | None):
+        # Known quirk: None is the default but setting it back to None
+        # doesn't actually take effect
+        medium = (output_medium or "").lower()
+        if medium == "audio":
+            medium = "voice"
+        if medium not in {"voice", "text"}:
             logger.warning(f"Unsupported Ultravox output medium: {output_medium}")
             return
-        await self._send({"type": "set_output_medium", "medium": output_medium})
+        await self._send({"type": "set_output_medium", "medium": medium})
 
     async def _send(self, content: bytes | dict[str, Any]):
         """Send content via the WebSocket connection.
@@ -611,7 +704,7 @@ class UltravoxRealtimeLLMService(LLMService):
         except Exception as e:
             if self._disconnecting or not self._socket:
                 return
-            await self.push_error("Ultravox websocket send error", e, fatal=True)
+            await self.push_error("Ultravox websocket send error", e, force_treat_as_permanent=True)
 
     #
     # response handling
@@ -676,7 +769,9 @@ class UltravoxRealtimeLLMService(LLMService):
                 except Exception as e:
                     if self._disconnecting or not self._socket:
                         return
-                    await self.push_error("Ultravox websocket receive error", e, fatal=True)
+                    await self.push_error(
+                        "Ultravox websocket receive error", e, force_treat_as_permanent=True
+                    )
         except ConnectionClosed:
             if self._disconnecting or not self._socket:
                 return
@@ -742,15 +837,16 @@ class UltravoxRealtimeLLMService(LLMService):
     async def _handle_agent_transcript(
         self, medium: str, text: str | None, delta: str | None, final: bool
     ):
+        transcript = text or delta
         if medium == "voice":
             # In voice mode, audio is handled by _handle_audio(). Here we push
             # text transcripts of the audio for downstream consumers.
-            if (text or delta) and not final:
-                frame = LLMTextFrame(text=text or delta)
+            if transcript and not final:
+                frame = LLMTextFrame(text=transcript)
                 frame.append_to_context = False
                 await self.push_frame(frame)
             if delta:
-                tts_frame = TTSTextFrame(text=delta, aggregated_by=AggregationType.WORD)
+                tts_frame = TTSTextFrame(text=delta, text_type=TextType.WORD)
                 tts_frame.includes_inter_frame_spaces = True
                 await self.push_frame(tts_frame)
         elif medium == "text":
@@ -758,10 +854,10 @@ class UltravoxRealtimeLLMService(LLMService):
                 await self.stop_processing_metrics()
                 await self.push_frame(LLMFullResponseEndFrame())
                 self._bot_responding = None
-            elif text or delta:
+            elif transcript:
                 if not self._bot_responding:
                     await self.start_processing_metrics()
                     await self.stop_ttfb_metrics()
                     await self.push_frame(LLMFullResponseStartFrame())
                     self._bot_responding = "text"
-                await self.push_frame(LLMTextFrame(text=text or delta))
+                await self.push_frame(LLMTextFrame(text=transcript))

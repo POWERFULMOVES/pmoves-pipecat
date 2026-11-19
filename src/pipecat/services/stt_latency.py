@@ -26,12 +26,11 @@ measured value to your STT service constructor:
 
     stt = DeepgramSTTService(api_key="...", ttfs_p99_latency=0.45)
 
-Turn-based STT services (e.g. ``CartesiaTurnsSTTService``,
-``DeepgramFluxSTTService``) have no meaningful TTFS metric — the server
-defines the turn boundary directly, so there is no separate "speech end →
-final transcript" interval to measure. Those services override the
-``STTService.supports_ttfs`` property to return False rather than supplying
-a constant here.
+Turn-based STT services (e.g. ``CartesiaTurnsSTTService``) have no meaningful
+TTFS metric — the server defines the turn boundary directly, so there is no
+separate "speech end → final transcript" interval to measure. Those services
+override the ``STTService.supports_ttfs`` property to return False rather than
+supplying a constant here.
 """
 
 # Conservative fallback for services without measured values
@@ -39,6 +38,7 @@ DEFAULT_TTFS_P99: float = 1.0
 
 # Measured P99 TTFS latency values (in seconds)
 ASSEMBLYAI_TTFS_P99: float = 0.42
+ASSEMBLYAI_SYNC_TTFS_P99: float = 0.65
 AWS_TRANSCRIBE_TTFS_P99: float = 1.90
 AZURE_TTFS_P99: float = 1.80
 CARTESIA_TTFS_P99: float = 0.81
@@ -47,10 +47,12 @@ DEEPGRAM_SAGEMAKER_TTFS_P99: float = 0.35
 ELEVENLABS_TTFS_P99: float = 2.01
 ELEVENLABS_REALTIME_TTFS_P99: float = 0.41
 FAL_TTFS_P99: float = 2.07
+GEMINI_TTFS_P99: float = 0.60
 GLADIA_TTFS_P99: float = 1.49
 GOOGLE_TTFS_P99: float = 1.57
 GRADIUM_TTFS_P99: float = 0.62
 GROQ_TTFS_P99: float = 1.54
+META_TTFS_P99: float = 1.92
 MISTRAL_TTFS_P99: float = 1.89
 OPENAI_TTFS_P99: float = 2.01
 OPENAI_REALTIME_TTFS_P99: float = 1.66
@@ -60,7 +62,16 @@ SONIOX_TTFS_P99: float = 0.35
 SPEECHMATICS_TTFS_P99: float = 0.74
 XAI_TTFS_P99: float = 2.14
 TOGETHER_TTFS_P99: float = 1.00
+# Pipecat turn detection mode (vad_force_turn_endpoint=True), default model.
+ZOOM_AI_TTFS_P99: float = 0.53
 
 # These services run locally and should be replaced with measured values
+DEEPGRAM_FLUX_TTFS_P99: float = 1.00
 NVIDIA_TTFS_P99: float = DEFAULT_TTFS_P99
+SARVAM_HTTP_TTFS_P99: float = DEFAULT_TTFS_P99
+SARVAM_REALTIME_TTFS_P99: float = DEFAULT_TTFS_P99
 WHISPER_TTFS_P99: float = DEFAULT_TTFS_P99
+
+# Not yet measured
+DEEPGRAM_SEGMENTED_TTFS_P99: float = DEFAULT_TTFS_P99
+RIME_TTFS_P99: float = DEFAULT_TTFS_P99

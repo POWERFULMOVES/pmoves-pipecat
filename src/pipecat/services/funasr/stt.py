@@ -21,11 +21,12 @@ from loguru import logger
 from typing_extensions import override
 
 from pipecat.frames.frames import ErrorFrame, Frame, TranscriptionFrame
-from pipecat.services.settings import NOT_GIVEN, STTSettings, _NotGiven, assert_given
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given
 
 try:
     from funasr import AutoModel
@@ -39,6 +40,9 @@ except ModuleNotFoundError as e:
 # Language codes natively supported by SenseVoice; anything else falls back to
 # automatic language detection.
 _FUNASR_LANGUAGES = {"zh", "en", "ja", "ko", "yue", "nospeech"}
+
+# FunASR models read 16 kHz audio.
+_FUNASR_SAMPLE_RATE = 16000
 
 
 def language_to_funasr_language(language: Language | str | None) -> str:
@@ -80,7 +84,7 @@ class FunASRSTTSettings(STTSettings):
         use_itn: Apply inverse text normalization (e.g. "nine" -> "9").
     """
 
-    use_itn: bool | None | _NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    use_itn: bool | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
 
 class FunASRSTTService(SegmentedSTTService):
@@ -90,11 +94,21 @@ class FunASRSTTService(SegmentedSTTService):
     multilingual (Chinese, Cantonese, English, Japanese, Korean, ...) with strong
     Chinese accuracy and fast non-autoregressive inference.
 
-    Audio is expected as 16 kHz, 16-bit signed PCM (the pipecat STT default).
+    Segments are resampled to the 16 kHz the model reads.
     """
 
     Settings = FunASRSTTSettings
     _settings: Settings
+
+    @property
+    def wants_wav_segments(self) -> bool:
+        """Receive segments as raw 16-bit PCM, which the model reads directly."""
+        return False
+
+    @property
+    def segment_sample_rate(self) -> int:
+        """Receive segments at 16 kHz, the rate FunASR reads."""
+        return _FUNASR_SAMPLE_RATE
 
     def __init__(
         self,

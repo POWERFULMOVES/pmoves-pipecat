@@ -6,9 +6,9 @@
 
 import asyncio
 import unittest
-from typing import TypedDict
+from typing import Any, TypedDict
 
-from pipecat.adapters.schemas.direct_function import DirectFunctionWrapper
+from pipecat.adapters.llm.schemas.direct_function import DirectFunctionWrapper
 from pipecat.services.llm_service import FunctionCallParams
 
 
@@ -126,6 +126,25 @@ class TestDirectFunction(unittest.TestCase):
             },
         )
 
+    def test_any_params_accept_any_value(self):
+        async def my_function_any_params(
+            params: FunctionCallParams,
+            value: Any,
+            tags: list[Any],
+            metadata: dict[str, Any],
+        ):
+            return {"status": "success"}, None
+
+        func = DirectFunctionWrapper(function=my_function_any_params)
+        self.assertEqual(
+            func.properties,
+            {
+                "value": {},
+                "tags": {"type": "array", "items": {}},
+                "metadata": {"type": "object", "additionalProperties": {}},
+            },
+        )
+
     def test_required_is_set_from_function(self):
         async def my_function_no_params(params: FunctionCallParams):
             return {"status": "success"}, None
@@ -151,6 +170,18 @@ class TestDirectFunction(unittest.TestCase):
 
         func = DirectFunctionWrapper(function=my_function_complex_params)
         self.assertEqual(func.required, ["address_lines"])
+
+    def test_var_args_are_not_tool_parameters(self):
+        # *args and **kwargs can't be passed by name, so the LLM must not be
+        # told they exist, let alone that they are required.
+        async def my_function_var_args(
+            params: FunctionCallParams, city: str, *args: Any, units: str = "c", **kwargs: Any
+        ):
+            return {"status": "success"}, None
+
+        func = DirectFunctionWrapper(function=my_function_var_args)
+        self.assertEqual(func.properties, {"city": {"type": "string"}, "units": {"type": "string"}})
+        self.assertEqual(func.required, ["city"])
 
     def test_property_descriptions_are_set_from_function(self):
         async def my_function(
@@ -188,19 +219,19 @@ class TestDirectFunction(unittest.TestCase):
         def my_function_non_async(params: FunctionCallParams):
             return {"status": "success"}, None
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(Exception, "must be async"):
             DirectFunctionWrapper(function=my_function_non_async)
 
         async def my_function_missing_params():
             return {"status": "success"}, None
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(Exception, "must have at least one parameter"):
             DirectFunctionWrapper(my_function_missing_params)
 
         async def my_function_misplaced_params(foo: str, params: FunctionCallParams):
             return {"status": "success"}, None
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(Exception, "first parameter must be named"):
             DirectFunctionWrapper(my_function_misplaced_params)
 
     def test_invoke_calls_function_with_args_and_params_object(self):

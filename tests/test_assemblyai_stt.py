@@ -9,14 +9,30 @@
 import asyncio
 import io
 import json
+import unittest
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from loguru import logger
+from websockets.protocol import State
 
-from pipecat.frames.frames import UserStartedSpeakingFrame
+from pipecat.frames.frames import (
+    InterimTranscriptionFrame,
+    ProposedUserStartedSpeakingFrame,
+    TranscriptionFrame,
+    TranscriptionSpeaker,
+)
+from pipecat.services.assemblyai.models import (
+    AssemblyAIConnectionParams,
+    TerminationMessage,
+    TurnMessage,
+    Word,
+)
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, is_u3_pro_model
 from pipecat.transcriptions.language import Language
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
+from pipecat.utils.asyncio.task_manager import TaskManager
+from tests.frame_processor_helpers import frame_processor_setup
 
 
 def _query(service: AssemblyAISTTService) -> dict[str, list[str]]:
@@ -24,14 +40,55 @@ def _query(service: AssemblyAISTTService) -> dict[str, list[str]]:
     return parse_qs(urlparse(service._build_ws_url()).query)
 
 
-def test_default_model_is_universal_3_5_pro():
-    # universal-3-5-pro is the default model sent to AssemblyAI.
+def _setup_service(service: AssemblyAISTTService, monkeypatch, sample_rate: int) -> None:
+    """Set the service up with the given input sample rate, without connecting."""
+
+    async def fake_connect():
+        pass
+
+    monkeypatch.setattr(service, "_connect", fake_connect)
+
+    async def run():
+        await service.setup(frame_processor_setup(TaskManager(), audio_in_sample_rate=sample_rate))
+
+    asyncio.run(run())
+
+
+def test_sample_rate_inherits_setup_when_omitted(monkeypatch):
     service = AssemblyAISTTService(api_key="test-key")
-    assert _query(service)["speech_model"] == ["universal-3-5-pro"]
+
+    _setup_service(service, monkeypatch, 8000)
+
+    assert service.sample_rate == 8000
+    assert _query(service)["sample_rate"] == ["8000"]
+
+
+def test_explicit_sample_rate_overrides_setup(monkeypatch):
+    service = AssemblyAISTTService(api_key="test-key", sample_rate=16000)
+
+    _setup_service(service, monkeypatch, 8000)
+
+    assert service.sample_rate == 16000
+    assert _query(service)["sample_rate"] == ["16000"]
+
+
+def test_default_model_is_assemblyai_stt_3_7_realtime_agent():
+    # assemblyai-stt-3-7-realtime-agent is the default model sent to AssemblyAI.
+    service = AssemblyAISTTService(api_key="test-key")
+    assert _query(service)["speech_model"] == ["assemblyai-stt-3-7-realtime-agent"]
+
+
+def test_deprecated_connection_params_default_to_assemblyai_stt_3_7_realtime_agent():
+    with pytest.warns(DeprecationWarning):
+        service = AssemblyAISTTService(
+            api_key="test-key", connection_params=AssemblyAIConnectionParams()
+        )
+    assert _query(service)["speech_model"] == ["assemblyai-stt-3-7-realtime-agent"]
 
 
 def test_continuous_partials_defaults_to_true_for_u3_pro():
-    # universal-3-5-pro is the default U3 Pro model; continuous_partials should be on by default.
+    # assemblyai-stt-3-7-realtime-agent is the default U3 Pro model; continuous_partials
+    # should be on by default.
     service = AssemblyAISTTService(api_key="test-key")
     assert _query(service)["continuous_partials"] == ["true"]
 
@@ -105,6 +162,12 @@ def test_interruption_delay_out_of_range_raises(value):
         ("u3-rt-pro", True),
         ("u3-rt-pro-beta-1", True),
         ("universal-3-5-pro", True),
+        ("universal-3-6-pro", True),
+        ("assemblyai-stt-3-7-realtime-agent", True),
+        # Not intended for voice-agent use cases.
+        ("assemblyai-stt-3-7-realtime", False),
+        # The Sync/async name is not a streaming model.
+        ("assemblyai-stt-3-7", False),
         ("universal-streaming-english", False),
         ("universal-streaming-multilingual", False),
         (None, False),
@@ -205,6 +268,127 @@ def test_update_agent_context_works_for_universal_3_5_pro():
     asyncio.run(service.update_agent_context("hello"))
 
     assert sent == [{"agent_context": "hello"}]
+
+
+# --- universal-3-6-pro (U3 Pro family; universal-3-5-pro upgraded) ---
+
+
+def test_u3_pro_features_sent_for_universal_3_6_pro():
+    # universal-3-6-pro is universal-3-5-pro upgraded and supports every u3-rt-pro param.
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            model="universal-3-6-pro",
+            agent_context="May I take your order?",
+            previous_context_n_turns=5,
+            interruption_delay=300,
+        ),
+    )
+    q = _query(service)
+    assert q["speech_model"] == ["universal-3-6-pro"]
+    assert q["agent_context"] == ["May I take your order?"]
+    assert q["previous_context_n_turns"] == ["5"]
+    assert q["interruption_delay"] == ["300"]
+    assert q["continuous_partials"] == ["true"]
+
+
+def test_universal_3_6_pro_allows_assemblyai_turn_detection_mode():
+    # vad_force_turn_endpoint=False requires a U3 Pro family model; u3.6 qualifies.
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(model="universal-3-6-pro"),
+        vad_force_turn_endpoint=False,
+    )
+    assert is_u3_pro_model(service._settings.model)
+
+
+def test_update_agent_context_works_for_universal_3_6_pro():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(model="universal-3-6-pro"),
+    )
+    sent = []
+
+    async def fake_send(**fields):
+        sent.append(fields)
+
+    service._send_update_configuration = fake_send
+    asyncio.run(service.update_agent_context("hello"))
+
+    assert sent == [{"agent_context": "hello"}]
+
+
+# --- assemblyai-stt-3-7-realtime-agent (U3 Pro family; Universal-3.7 voice agents) ---
+
+
+def test_u3_pro_features_sent_for_assemblyai_stt_3_7_realtime_agent():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            model="assemblyai-stt-3-7-realtime-agent",
+            prompt="Outbound call to a health insurance payer.",
+            agent_context="May I take your order?",
+            previous_context_n_turns=5,
+            interruption_delay=300,
+            language_codes=[Language.EN],
+        ),
+    )
+    q = _query(service)
+    assert q["speech_model"] == ["assemblyai-stt-3-7-realtime-agent"]
+    assert q["prompt"] == ["Outbound call to a health insurance payer."]
+    assert q["agent_context"] == ["May I take your order?"]
+    assert q["previous_context_n_turns"] == ["5"]
+    assert q["interruption_delay"] == ["300"]
+    assert q["continuous_partials"] == ["true"]
+    assert q["language_codes"] == [json.dumps(["en"])]
+
+
+def test_assemblyai_stt_3_7_realtime_agent_allows_assemblyai_turn_detection_mode():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(model="assemblyai-stt-3-7-realtime-agent"),
+        vad_force_turn_endpoint=False,
+    )
+    assert is_u3_pro_model(service._settings.model)
+
+
+def test_update_agent_context_works_for_assemblyai_stt_3_7_realtime_agent():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(model="assemblyai-stt-3-7-realtime-agent"),
+    )
+    sent = []
+
+    async def fake_send(**fields):
+        sent.append(fields)
+
+    service._send_update_configuration = fake_send
+    asyncio.run(service.update_agent_context("hello"))
+
+    assert sent == [{"agent_context": "hello"}]
+
+
+def test_deprecated_connection_params_accept_assemblyai_stt_3_7_realtime_agent():
+    with pytest.warns(DeprecationWarning):
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            connection_params=AssemblyAIConnectionParams(
+                speech_model="assemblyai-stt-3-7-realtime-agent"
+            ),
+        )
+    assert _query(service)["speech_model"] == ["assemblyai-stt-3-7-realtime-agent"]
+    assert is_u3_pro_model(service._settings.model)
+
+
+def test_assemblyai_stt_3_7_realtime_is_not_a_voice_agent_model():
+    # Not intended for voice-agent use cases, so AssemblyAI's built-in turn
+    # detection is rejected for it.
+    with pytest.raises(ValueError, match="requires a U3 Pro model"):
+        AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(model="assemblyai-stt-3-7-realtime"),
+            vad_force_turn_endpoint=False,
+        )
 
 
 # --- agent_context (context carryover) connection parameter ---
@@ -497,6 +681,43 @@ def test_language_codes_sent_json_encoded(languages, expected):
     assert _query(service)["language_codes"] == [json.dumps(expected)]
 
 
+@pytest.mark.parametrize(
+    "language, expected",
+    [
+        (Language.UR, "ur"),
+        (Language.RU, "ru"),
+        (Language.KO, "ko"),
+        (Language.CA, "ca"),
+        (Language.GL, "gl"),
+        (Language.RO, "ro"),
+        (Language.ET, "et"),
+        (Language.FA, "fa"),
+        (Language.YUE, "yue"),
+        (Language.AF, "af"),
+        (Language.MR, "mr"),
+        (Language.ZU, "zu"),
+        (Language.XH, "xh"),
+        (Language.NN, "nn"),
+    ],
+)
+def test_language_codes_covers_universal_3_6_pro_additions(language, expected):
+    # universal-3-6-pro inherits universal-3-5-pro's full T1+T2+T3 language set;
+    # these are verified-map entries, not the unlisted-language fallback.
+    sink = io.StringIO()
+    handler_id = logger.add(sink, level="WARNING", format="{message}")
+    try:
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(language_codes=[language]),
+        )
+        query = _query(service)
+    finally:
+        logger.remove(handler_id)
+
+    assert query["language_codes"] == [json.dumps([expected])]
+    assert "not verified" not in sink.getvalue()
+
+
 @pytest.mark.parametrize("model", ["universal-streaming-multilingual", "u3-rt-pro-beta-1"])
 def test_language_codes_sent_for_u3_pro_models_only(model):
     # Steering is prompt-based, so only the U3 Pro family accepts it.
@@ -588,9 +809,9 @@ def test_language_codes_unlisted_language_forwarded():
     # verified map is forwarded as its base code rather than rejected here.
     service = AssemblyAISTTService(
         api_key="test-key",
-        settings=AssemblyAISTTService.Settings(language_codes=[Language.KO]),
+        settings=AssemblyAISTTService.Settings(language_codes=[Language.PL]),
     )
-    assert _query(service)["language_codes"] == [json.dumps(["ko"])]
+    assert _query(service)["language_codes"] == [json.dumps(["pl"])]
 
 
 def test_language_codes_at_limit_allowed():
@@ -648,14 +869,24 @@ def test_prompt_and_keyterms_sent_together_for_u3_rt_pro():
 
 
 def test_prompt_and_keyterms_raise_for_universal_streaming():
-    # Older models keep the client-side mutual-exclusivity check.
-    with pytest.raises(ValueError, match="only U3 Pro models"):
+    with pytest.raises(ValueError, match="only supported by U3 Pro models"):
         AssemblyAISTTService(
             api_key="test-key",
             settings=AssemblyAISTTService.Settings(
                 model="universal-streaming-english",
                 prompt="Some context for the session.",
                 keyterms_prompt=["alpha", "beta"],
+            ),
+        )
+
+
+def test_prompt_alone_raises_for_universal_streaming():
+    with pytest.raises(ValueError, match="only supported by U3 Pro models"):
+        AssemblyAISTTService(
+            api_key="test-key",
+            settings=AssemblyAISTTService.Settings(
+                model="universal-streaming-english",
+                prompt="Some context for the session.",
             ),
         )
 
@@ -957,9 +1188,9 @@ def test__process_assistant_turn_noop_when_carryover_disabled():
     assert sent == []
 
 
-def test_speech_started_starts_metrics_after_interruption():
-    # broadcast_interruption() stops all metrics, so processing metrics must
-    # start after it or they would be stopped immediately.
+def test_speech_started_proposes_turn_without_interrupting():
+    # The service proposes the turn; the user turn strategies decide it and own
+    # the interruption, so nothing is interrupted from here.
     service = AssemblyAISTTService(api_key="test-key", vad_force_turn_endpoint=False)
     events = []
 
@@ -969,21 +1200,298 @@ def test_speech_started_starts_metrics_after_interruption():
     async def fake_broadcast_interruption():
         events.append(("interruption", None))
 
-    async def fake_start_processing_metrics():
-        events.append(("start_metrics", None))
-
     service.broadcast_frame = fake_broadcast_frame
     service.broadcast_interruption = fake_broadcast_interruption
-    service.start_processing_metrics = fake_start_processing_metrics
 
     asyncio.run(service._handle_speech_started(None))
 
-    assert events == [
-        ("broadcast", UserStartedSpeakingFrame),
-        ("interruption", None),
-        ("start_metrics", None),
+    assert events == [("broadcast", ProposedUserStartedSpeakingFrame)]
+
+
+def test_termination_acknowledges_without_ending_pipeline():
+    # The server sends Termination in reply to our Terminate, including on a
+    # settings-triggered reconnect, so it must not end the pipeline.
+    service = AssemblyAISTTService(api_key="test-key")
+    pushed = []
+
+    async def fake_push_frame(frame, direction=None):
+        pushed.append(frame)
+
+    service.push_frame = fake_push_frame
+
+    message = TerminationMessage(
+        type="Termination", audio_duration_seconds=1, session_duration_seconds=2
+    )
+    asyncio.run(service._handle_termination(message))
+
+    assert service._termination_event.is_set()
+    assert pushed == []
+
+
+def test_should_interrupt_rides_on_recommended_strategies():
+    # should_interrupt no longer gates a local broadcast; it configures the
+    # strategies the service recommends via its metadata frame.
+    for should_interrupt in (True, False):
+        service = AssemblyAISTTService(
+            api_key="test-key",
+            vad_force_turn_endpoint=False,
+            should_interrupt=should_interrupt,
+        )
+        strategies = service.service_metadata_frame().user_turn_strategies
+        assert isinstance(strategies, ExternalUserTurnStrategies)
+        assert strategies.enable_interruptions is should_interrupt
+
+
+# --- Speaker diarization ---
+
+
+def _turn(
+    transcript: str,
+    *,
+    end_of_turn: bool,
+    speaker: str | None = None,
+    words: list[tuple[str, str | None]] | None = None,
+) -> TurnMessage:
+    return TurnMessage(
+        turn_order=0,
+        turn_is_formatted=end_of_turn,
+        end_of_turn=end_of_turn,
+        transcript=transcript,
+        end_of_turn_confidence=1.0,
+        words=[
+            Word(start=0, end=1, text=text, confidence=1.0, word_is_final=True, speaker=label)
+            for text, label in words or []
+        ],
+        speaker=speaker,
+    )
+
+
+def _transcription_frames(service: AssemblyAISTTService, message: TurnMessage) -> list:
+    """Run one Turn message through the service and return the pushed frames."""
+    pushed = []
+
+    async def fake_push_frame(frame, direction=None):
+        pushed.append(frame)
+
+    service.push_frame = fake_push_frame
+    asyncio.run(service._handle_transcription(message))
+    return [f for f in pushed if isinstance(f, (TranscriptionFrame, InterimTranscriptionFrame))]
+
+
+@pytest.mark.parametrize("vad_force_turn_endpoint", [True, False])
+def test_final_turn_carries_speaker_and_keeps_user_id(vad_force_turn_endpoint):
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        vad_force_turn_endpoint=vad_force_turn_endpoint,
+        settings=AssemblyAISTTService.Settings(speaker_labels=True),
+    )
+    service._user_id = "session-user"
+
+    frames = _transcription_frames(service, _turn("Hello", end_of_turn=True, speaker="A"))
+
+    assert len(frames) == 1
+    assert isinstance(frames[0], TranscriptionFrame)
+    assert frames[0].text == "Hello"
+    assert frames[0].speaker.label == "A"
+    assert frames[0].user_id == "session-user"
+
+
+def test_interim_turn_without_speaker_has_no_label():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            speaker_labels=True, speaker_format="{speaker}: {text}"
+        ),
+    )
+
+    frames = _transcription_frames(service, _turn("Hel", end_of_turn=False))
+
+    assert isinstance(frames[0], InterimTranscriptionFrame)
+    assert frames[0].text == "Hel"
+    assert frames[0].speaker is None
+
+
+def test_speaker_format_setting_labels_text():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            speaker_labels=True, speaker_format="{speaker}: {text}"
+        ),
+    )
+
+    frames = _transcription_frames(service, _turn("Hello", end_of_turn=True, speaker="B"))
+
+    assert frames[0].text == "B: Hello"
+    assert frames[0].speaker.label == "B"
+
+
+def test_deprecated_speaker_format_arg_moves_to_settings():
+    with pytest.warns(DeprecationWarning, match="speaker_format"):
+        service = AssemblyAISTTService(api_key="test-key", speaker_format="{speaker}: {text}")
+
+    assert service._settings.speaker_format == "{speaker}: {text}"
+
+
+def test_speaker_format_not_sent_to_assemblyai():
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(speaker_format="{speaker}: {text}"),
+    )
+
+    assert "speaker_format" not in _query(service)
+
+
+def test_update_settings_speaker_format_does_not_reconnect():
+    service = AssemblyAISTTService(api_key="test-key")
+    sent, reconnects = _stub_connection(service)
+
+    delta = AssemblyAISTTService.Settings(speaker_format="{speaker}: {text}")
+    changed = asyncio.run(service._update_settings(delta))
+
+    assert "speaker_format" in changed
+    assert sent == []
+    assert reconnects == []
+
+
+@pytest.mark.parametrize("placeholder", ["PENDING", "UNKNOWN"])
+def test_unassigned_speaker_is_not_a_label(placeholder):
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        settings=AssemblyAISTTService.Settings(
+            speaker_labels=True, speaker_format="{speaker}: {text}"
+        ),
+    )
+
+    frames = _transcription_frames(service, _turn("Hello", end_of_turn=True, speaker=placeholder))
+
+    assert frames[0].speaker is None
+    assert frames[0].text == "Hello"
+
+
+def test_speaker_revision_is_not_an_error():
+    service = AssemblyAISTTService(
+        api_key="test-key", settings=AssemblyAISTTService.Settings(speaker_labels=True)
+    )
+    errors = []
+
+    async def fake_push_error(*args, **kwargs):
+        errors.append((args, kwargs))
+
+    service.push_error = fake_push_error
+    message = {
+        "type": "SpeakerRevision",
+        "revisions": [{"turn_order": 0, "speaker_label": "B", "words": []}],
+    }
+
+    asyncio.run(service._handle_message(message))
+
+    assert errors == []
+
+
+def test_final_turn_is_split_by_word_speakers():
+    """A turn holding two speakers becomes one frame per speaker run."""
+    service = AssemblyAISTTService(
+        api_key="test-key",
+        vad_force_turn_endpoint=False,
+        settings=AssemblyAISTTService.Settings(
+            speaker_labels=True, speaker_format="{speaker}: {text}"
+        ),
+    )
+    message = _turn(
+        "Mine is the banana. I take the train.",
+        end_of_turn=True,
+        speaker="B",
+        words=[
+            ("Mine", "B"),
+            ("is", "B"),
+            ("the", "B"),
+            ("banana.", "B"),
+            ("I", "A"),
+            ("take", "A"),
+            ("the", "A"),
+            ("train.", "A"),
+        ],
+    )
+
+    frames = _transcription_frames(service, message)
+
+    assert [(f.speaker, f.text, f.finalized) for f in frames] == [
+        (TranscriptionSpeaker("B", 1), "B: Mine is the banana.", False),
+        (TranscriptionSpeaker("A", 2), "A: I take the train.", True),
+    ]
+
+
+def test_unassigned_word_takes_the_turn_speaker():
+    service = AssemblyAISTTService(
+        api_key="test-key", settings=AssemblyAISTTService.Settings(speaker_labels=True)
+    )
+    message = _turn(
+        "Yeah. Different.",
+        end_of_turn=True,
+        speaker="A",
+        words=[("Yeah.", "PENDING"), ("Different.", "A")],
+    )
+
+    frames = _transcription_frames(service, message)
+
+    assert [(f.speaker, f.text) for f in frames] == [
+        (TranscriptionSpeaker("A", 1), "Yeah. Different."),
+    ]
+
+
+def test_turn_speaker_is_used_when_words_do_not_match_the_transcript():
+    service = AssemblyAISTTService(
+        api_key="test-key", settings=AssemblyAISTTService.Settings(speaker_labels=True)
+    )
+    message = _turn(
+        "It takes 40 minutes.",
+        end_of_turn=True,
+        speaker="A",
+        words=[("It", "A"), ("takes", "A"), ("forty", "B"), ("minutes.", "B")],
+    )
+
+    frames = _transcription_frames(service, message)
+
+    assert [(f.speaker, f.text) for f in frames] == [
+        (TranscriptionSpeaker("A", 1), "It takes 40 minutes."),
     ]
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_disconnect_terminates_an_open_session_before_closing():
+    service = AssemblyAISTTService(api_key="test-key")
+    service._audio_buffer.extend(b"\1\2")
+    events = []
+
+    class FakeWebsocket:
+        state = State.OPEN
+
+        async def send(self, message):
+            events.append(("send", message))
+            if message == json.dumps({"type": "Terminate"}):
+                # The receive loop sets this on the server's Termination reply.
+                service._termination_event.set()
+
+        async def close(self):
+            events.append("close")
+
+    async def fake_cancel_task(task, timeout=None):
+        events.append(("cancel", task))
+
+    service._websocket = FakeWebsocket()
+    service._receive_task = "receive-task"
+    service.cancel_task = fake_cancel_task
+
+    asyncio.run(service._disconnect())
+
+    assert events == [
+        ("send", b"\1\2"),
+        ("send", json.dumps({"type": "Terminate"})),
+        ("cancel", "receive-task"),
+        "close",
+    ]
+    assert service._receive_task is None
+    assert service._websocket is None

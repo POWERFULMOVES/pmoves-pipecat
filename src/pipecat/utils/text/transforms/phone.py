@@ -8,12 +8,14 @@
 
 import re
 
-from pipecat.frames.frames import AggregationType
+from pipecat.frames.frames import TextType
 
 # Matches common phone formats: (123) 456-7890, 123-456-7890, 123.456.7890,
 # +1 800 555 1234, etc.
 _PHONE_RE = re.compile(
     r"(?<!\d)"  # not preceded by a digit (no partial match inside a longer number)
+    r"(?<!\d\.)"  # not the fraction of a decimal ("3.1415926535")
+    r"(?<![$€£¥₹])"  # not a currency amount ("$2500000000")
     r"(\+?1[\s.\-]?)?"  # optional country code
     r"(\(?\d{3}\)?[\s.\-]?)"  # area code
     r"(\d{3}[\s.\-]?)"  # exchange
@@ -27,7 +29,7 @@ def _space_digits(match: re.Match) -> str:
     return " ".join(digits)
 
 
-async def expand_phone_numbers(text: str, aggregation_type: str | AggregationType) -> str:
+async def expand_phone_numbers(text: str, text_type: str | TextType) -> str:
     """Space out phone number digits so TTS reads them individually.
 
     This transformer is alphanumeric-preserving: digits are kept, only separators
@@ -36,7 +38,7 @@ async def expand_phone_numbers(text: str, aggregation_type: str | AggregationTyp
 
     Args:
         text: Input text possibly containing phone numbers.
-        aggregation_type: Aggregation type of the text frame (unused).
+        text_type: Text type of the text frame (unused).
 
     Returns:
         Text with phone numbers replaced by space-separated digit sequences.

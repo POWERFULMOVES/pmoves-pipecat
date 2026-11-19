@@ -13,8 +13,12 @@ as a unit regardless of internal punctuation.
 
 from collections.abc import AsyncIterator, Sequence
 
-from pipecat.utils.string import StartEndTags, parse_start_end_tags
-from pipecat.utils.text.base_text_aggregator import Aggregation, AggregationType
+from pipecat.utils.string import (
+    StartEndTags,
+    longest_trailing_partial_match,
+    parse_start_end_tags,
+)
+from pipecat.utils.text.base_text_aggregator import Aggregation, TextType
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 
 
@@ -44,6 +48,11 @@ class SkipTagsAggregator(SimpleTextAggregator):
         self._current_tag: StartEndTags | None = None
         self._current_tag_index: int = 0
 
+    @property
+    def tags(self) -> Sequence[StartEndTags]:
+        """The tag pairs whose text is kept in one aggregation."""
+        return self._tags
+
     async def aggregate(self, text: str) -> AsyncIterator[Aggregation]:
         """Aggregate text while respecting tag boundaries.
 
@@ -52,7 +61,10 @@ class SkipTagsAggregator(SimpleTextAggregator):
         inside tags.
 
         In TOKEN mode, text is passed through immediately unless we're inside
-        a tag, in which case we buffer until the closing tag is found.
+        a tag, in which case we buffer until the closing tag is found. Text
+        ending in a partial start tag (e.g. ``<spe`` of ``<spell>``) is held
+        back until a later chunk determines whether it begins a tag, so a tag
+        split across chunks is still recognized.
 
         Args:
             text: Text to aggregate.
@@ -61,7 +73,7 @@ class SkipTagsAggregator(SimpleTextAggregator):
             Aggregation objects containing text up to a sentence boundary,
             marked as SENTENCE type (or TOKEN type in TOKEN mode).
         """
-        if self._aggregation_type == AggregationType.TOKEN:
+        if self._aggregation_type == TextType.TOKEN:
             # In TOKEN mode, process chars for tag tracking but yield the
             # full input as a single token when not inside a tag.
             for char in text:
@@ -72,10 +84,21 @@ class SkipTagsAggregator(SimpleTextAggregator):
                     self._text, self._tags, self._current_tag, self._current_tag_index
                 )
 
-            # After processing all chars: if not inside a tag, yield accumulated text
+            # After processing all chars: if not inside a tag, yield accumulated text.
+            # A trailing partial start tag (e.g. "<spe" of "<spell>") is held back
+            # so a tag split across chunks isn't leaked as plain text; it's retained
+            # in the buffer to be completed by the next chunk. The tag-scan index
+            # resets to 0 so the retained partial tag is rescanned once complete.
             if not self._current_tag and self._text:
-                yield Aggregation(text=self._text, type=AggregationType.TOKEN)
-                self._text = ""
+                held_back = longest_trailing_partial_match(
+                    self._text, [start for start, _ in self._tags]
+                )
+                yield_length = len(self._text) - held_back
+                if yield_length > 0:
+                    content = self._text[:yield_length]
+                    self._text = self._text[yield_length:]
+                    self._current_tag_index = 0
+                    yield Aggregation(text=content, type=TextType.TOKEN)
             return
 
         # Process text character by character
@@ -91,10 +114,45 @@ class SkipTagsAggregator(SimpleTextAggregator):
             if self._current_tag:
                 continue
 
-            # Otherwise, use parent's lookahead logic for sentence detection
-            result = await super()._check_sentence_with_lookahead(char)
+            # Otherwise, use parent's lookahead logic for sentence detection,
+            # ignoring boundaries inside tags that have already closed.
+            result = await super()._check_sentence_with_lookahead(
+                char, protected_end=self._closed_tags_offset()
+            )
             if result:
+                # The buffer was trimmed, so rescan it from the start for tags.
+                self._current_tag_index = 0
                 yield result
+
+    def _closed_tags_offset(self) -> int:
+        """Return the buffer offset just past the last closing tag, or 0 if none."""
+        return max(
+            (
+                self._text.rfind(end_tag) + len(end_tag)
+                for _, end_tag in self._tags
+                if end_tag in self._text
+            ),
+            default=0,
+        )
+
+    async def flush(self) -> Aggregation | None:
+        """Flush any remaining text in the buffer.
+
+        In SENTENCE mode, returns the buffered text as-is: tags are
+        pass-through markers, so content is spoken whether or not a start
+        tag's closing tag ever arrived. In TOKEN mode, returns any text
+        still buffered behind an unclosed tag instead of discarding it.
+
+        Returns:
+            Any remaining text, or None if the buffer is empty.
+        """
+        if self._aggregation_type == TextType.TOKEN:
+            if self._text:
+                result = self._text
+                await self.reset()
+                return Aggregation(text=result, type=TextType.TOKEN)
+            return None
+        return await super().flush()
 
     async def handle_interruption(self):
         """Handle interruptions by clearing the buffer and tag state.

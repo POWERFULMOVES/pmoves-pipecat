@@ -49,7 +49,7 @@ class LLMContextWorker(LLMWorker):
 
     def __init__(
         self,
-        name: str,
+        name: str | None = None,
         *,
         llm: LLMService[Any],
         active: bool = False,
@@ -58,11 +58,14 @@ class LLMContextWorker(LLMWorker):
         context: LLMContext | None = None,
         user_params: LLMUserAggregatorParams | None = None,
         assistant_params: LLMAssistantAggregatorParams | None = None,
+        **kwargs: Any,
     ):
         """Initialize the LLMContextWorker.
 
         Args:
-            name: Unique name for this worker.
+            name: Unique name for this worker on the bus. Auto-generated when
+                omitted; give one when other workers address this one by
+                name, as they must when it runs in another process.
             llm: The LLM service.
             active: Whether the worker starts active. Defaults to False.
             bridged: Bridge configuration forwarded to ``PipelineWorker``.
@@ -75,6 +78,8 @@ class LLMContextWorker(LLMWorker):
             user_params: Optional parameters for the user aggregator.
             assistant_params: Optional parameters for the assistant
                 aggregator.
+            **kwargs: Additional arguments forwarded to :class:`LLMWorker`
+                and on to ``PipelineWorker``.
         """
         self._context = context or LLMContext()
         self._aggregators = LLMContextAggregatorPair(
@@ -98,6 +103,7 @@ class LLMContextWorker(LLMWorker):
             active=active,
             bridged=bridged,
             defer_tool_frames=defer_tool_frames,
+            **kwargs,
         )
 
     @property

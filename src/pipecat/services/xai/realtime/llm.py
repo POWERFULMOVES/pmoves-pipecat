@@ -16,22 +16,26 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import Any
+from typing import Any, Self, cast
 from urllib.parse import quote
 
 from loguru import logger
 from typing_extensions import override
 from websockets.asyncio.client import connect as websocket_connect
 
-from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.adapters.services.grok_realtime_adapter import GrokRealtimeLLMAdapter
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
+from pipecat.adapters.llm.services.grok_realtime_adapter import GrokRealtimeLLMAdapter
+from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
-    AggregationType,
     BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallCancelFrame,
+    FunctionCallResultFrame,
     InputAudioRawFrame,
+    InputDTMFFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -40,7 +44,9 @@ from pipecat.frames.frames import (
     LLMServiceMetadataFrame,
     LLMSetToolsFrame,
     LLMTextFrame,
-    StartFrame,
+    ProposedUserStartedSpeakingFrame,
+    ProposedUserStoppedSpeakingFrame,
+    TextType,
     TranscriptionFrame,
     TTSAudioRawFrame,
     TTSStartedFrame,
@@ -51,18 +57,18 @@ from pipecat.frames.frames import (
 )
 from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators import async_tool_messages
-from pipecat.processors.aggregators.llm_context import LLMContext, LLMSpecificMessage
-from pipecat.processors.frame_processor import FrameDirection
-from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
-from pipecat.services.settings import (
-    NOT_GIVEN,
-    LLMSettings,
-    _NotGiven,
-    assert_given,
-    is_given,
+from pipecat.processors.aggregators.llm_context import (
+    LLMContext,
+    LLMSpecificMessage,
+    standard_message_text,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessorSetup
+from pipecat.services.llm_service import FunctionCallFromLLM, LLMService
+from pipecat.services.settings import LLMSettings
 from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
+from pipecat.utils.tracing.service_decorators import traced_realtime_llm
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 from . import events
 
@@ -94,7 +100,7 @@ class GrokRealtimeLLMSettings(LLMSettings):
             top-level ``system_instruction`` field.
     """
 
-    session_properties: events.SessionProperties | _NotGiven = field(
+    session_properties: events.SessionProperties | NotGiven = field(
         default_factory=lambda: NOT_GIVEN
     )
 
@@ -111,7 +117,7 @@ class GrokRealtimeLLMSettings(LLMSettings):
 
     # -- apply_update override -----------------------------------------------
 
-    def apply_update(self, delta: "GrokRealtimeLLMService.Settings") -> dict[str, Any]:
+    def apply_update(self, delta: Self) -> dict[str, Any]:
         """Merge a delta, keeping ``system_instruction`` in sync with SP.
 
         When the delta contains ``session_properties``, it **replaces** the
@@ -178,6 +184,7 @@ class GrokRealtimeLLMSettings(LLMSettings):
         return instance
 
 
+@traced_realtime_llm
 class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
     """Grok Realtime Voice Agent LLM service providing real-time audio and text communication.
 
@@ -193,8 +200,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         - Custom function calling
         - Server-side VAD (Voice Activity Detection)
 
-    Emits ``UserStartedSpeakingFrame`` / ``UserStoppedSpeakingFrame`` from
-    Grok's server-side VAD events. ``LLMContextAggregatorPair`` auto-detects
+    Proposes turn boundaries from Grok's server-side VAD events, which the
+    recommended external user turn strategies resolve into
+    ``UserStartedSpeakingFrame`` / ``UserStoppedSpeakingFrame``.
+    ``LLMContextAggregatorPair`` auto-detects
     this realtime service and decouples context writes from those frames. If
     you wire local VAD (``LLMUserAggregatorParams.vad_analyzer``) on top of
     this service, disable Grok's server-side turn detection first via
@@ -246,7 +255,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         """
         # 1. Initialize default_settings with hardcoded defaults
         default_settings = self.Settings(
-            model="grok-voice-think-fast-1.0",
+            model="grok-voice-latest",
             system_instruction=None,
             temperature=None,
             max_tokens=None,
@@ -287,13 +296,14 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._audio_input_paused = start_audio_paused
         self._websocket = None
         self._receive_task = None
-        self._context: LLMContext = None
+        self._context: LLMContext | None = None
 
         self._llm_needs_conversation_setup = True
 
         self._disconnecting = False
         self._api_session_ready = False
         self._run_llm_when_api_session_ready = False
+        self._logged_audio_drop_before_session_ready = False
 
         self._current_assistant_response = None
         self._current_audio_response = None
@@ -301,9 +311,29 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._messages_added_manually = {}
         self._pending_function_calls = {}
         self._completed_tool_calls = set()
+        # Calls the API is waiting on, by call_id: only these can be answered
+        # with a function_call_output. Cleared on disconnect, since a reconnect
+        # replays the conversation as text and the API no longer knows the ids.
+        self._open_function_calls: set[str] = set()
+        # Something was delivered that no response has taken in yet. A response
+        # starting clears it; an inference request while it stands creates one.
+        self._results_awaiting_response = False
+        # A response was asked for while one was already running, and is owed
+        # once that one is done.
+        self._response_create_owed = False
+        self._response_active = False
+
+        self._session_id: str | None = None
+        self._conversation_id: str | None = None
+        self._current_response_id: str | None = None
 
         self._register_event_handler("on_conversation_item_created")
         self._register_event_handler("on_conversation_item_updated")
+        self._register_event_handler("on_conversation_item_deleted")
+        self._register_event_handler("on_conversation_item_truncated")
+        self._register_event_handler("on_idle_timeout")
+        self._register_event_handler("on_dtmf_received")
+        self._register_event_handler("on_mcp_event")
 
     def can_generate_metrics(self) -> bool:
         """Check if the service can generate usage metrics.
@@ -343,7 +373,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         if audio_config and audio_config.format:
             # PCM format has configurable rate
-            if hasattr(audio_config.format, "rate"):
+            if isinstance(audio_config.format, events.PCMAudioFormat):
                 return audio_config.format.rate
             # PCMU/PCMA formats are fixed at 8000 Hz (G.711 standard)
             elif audio_config.format.type in ("audio/pcmu", "audio/pcma"):
@@ -373,6 +403,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             return session_properties.turn_detection.type == "server_vad"
         return False
 
+    @property
+    def accepts_intermediate_function_call_results(self) -> bool:
+        """Intermediate results reach the model as conversation items.
+
+        The API takes one output per function call, so an intermediate result
+        goes in beside the call instead of through it (see :meth:`push_frame`).
+        """
+        return True
+
     def service_metadata_frame(self) -> LLMServiceMetadataFrame:
         """Realtime service; recommends external turn strategies when server-side VAD is active."""
         emits_turn_frames = self._is_turn_detection_enabled()
@@ -384,13 +423,23 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         )
 
     async def _handle_interruption(self):
-        """Handle user interruption of assistant speech."""
+        """Handle user interruption of assistant speech.
+
+        Always send ``response.cancel`` so in-flight assistant audio stops on
+        the wire promptly. When server VAD is off, also clear the input buffer
+        (manual turn mode owns commit/cancel). With server VAD on, leave the
+        input buffer intact so the interrupting user speech is not wiped.
+        """
         if not self._is_turn_detection_enabled():
             await self.send_client_event(events.InputAudioBufferClearEvent())
-            await self.send_client_event(events.ResponseCancelEvent())
+
+        await self.send_client_event(events.ResponseCancelEvent())
 
         await self._truncate_current_audio_response()
         await self.stop_all_metrics()
+        # Whatever the interrupted response was going to say is moot, and so is
+        # a response owed behind it: the user's turn makes one of its own.
+        self._response_create_owed = False
 
         if self._current_assistant_response:
             await self.push_frame(LLMFullResponseEndFrame())
@@ -411,7 +460,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._current_audio_response = None
 
     def _calculate_audio_duration_ms(
-        self, total_bytes: int, sample_rate: int = None, bytes_per_sample: int = 2
+        self, total_bytes: int, sample_rate: int | None = None, bytes_per_sample: int = 2
     ) -> int:
         """Calculate audio duration in milliseconds based on PCM audio parameters."""
         if sample_rate is None:
@@ -421,18 +470,64 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         return int(duration_seconds * 1000)
 
     async def _truncate_current_audio_response(self):
-        """Truncates the current audio response.
+        """Truncate the in-flight assistant audio item on the server and locally.
 
-        Note: Grok may not support truncation events like OpenAI.
-        This is a best-effort cleanup.
+        Sends ``conversation.item.truncate`` at the shorter of wall-clock elapsed
+        time and bytes received so conversation history matches what the user
+        heard. Failures are non-fatal — ``response.cancel`` still stops playback.
         """
         if not self._current_audio_response:
             return
 
         try:
+            current = self._current_audio_response
             self._current_audio_response = None
+
+            audio_duration_ms = self._calculate_audio_duration_ms(current.total_size)
+            elapsed_ms = int(time.time() * 1000 - current.start_time_ms)
+            truncate_ms = max(0, min(elapsed_ms, audio_duration_ms))
+
+            logger.trace(
+                f"Truncating audio: duration={audio_duration_ms}ms, "
+                f"elapsed={elapsed_ms}ms, truncate={truncate_ms}ms"
+            )
+
+            await self.send_client_event(
+                events.ConversationItemTruncateEvent(
+                    item_id=current.item_id,
+                    content_index=current.content_index,
+                    audio_end_ms=truncate_ms,
+                )
+            )
         except Exception as e:
-            logger.warning(f"Audio truncation cleanup failed (non-fatal): {e}")
+            logger.warning(f"Audio truncation failed (non-fatal): {e}")
+
+    async def delete_conversation_item(self, item_id: str):
+        """Delete a conversation item by id.
+
+        Args:
+            item_id: ID of the conversation item to delete.
+        """
+        await self.send_client_event(events.ConversationItemDeleteEvent(item_id=item_id))
+
+    async def force_message(self, text: str):
+        """Speak a hard-coded TTS line without involving the model.
+
+        Sends a ``force_message`` conversation item. Do not follow with
+        ``response.create`` — the server injects the response lifecycle.
+
+        Args:
+            text: Verbatim text to synthesize and play.
+        """
+        await self.send_client_event(
+            events.ConversationItemCreateEvent(
+                item=events.ConversationItem(
+                    type="force_message",
+                    role="assistant",
+                    content=[events.ItemContent(type="text", text=text)],
+                )
+            )
+        )
 
     #
     # Standard AIService frame handling
@@ -452,21 +547,25 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             props.audio = events.AudioConfiguration()
         if not props.audio.input:
             props.audio.input = events.AudioInput(
-                format=events.PCMAudioFormat(rate=input_sample_rate)
+                format=events.PCMAudioFormat(
+                    rate=cast(events.SUPPORTED_SAMPLE_RATES, input_sample_rate)
+                )
             )
         if not props.audio.output:
             props.audio.output = events.AudioOutput(
-                format=events.PCMAudioFormat(rate=output_sample_rate)
+                format=events.PCMAudioFormat(
+                    rate=cast(events.SUPPORTED_SAMPLE_RATES, output_sample_rate)
+                )
             )
 
-    async def start(self, frame: StartFrame):
-        """Start the service and establish WebSocket connection.
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service and connect.
 
         Args:
-            frame: The start frame triggering service initialization.
+            setup: Configuration object containing setup parameters.
         """
-        await super().start(frame)
-        self._ensure_audio_config(frame.audio_in_sample_rate, frame.audio_out_sample_rate)
+        await super().setup(setup)
+        self._ensure_audio_config(setup.audio_in_sample_rate, setup.audio_out_sample_rate)
         await self._connect()
 
     async def stop(self, frame: EndFrame):
@@ -508,7 +607,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if isinstance(frame, TranscriptionFrame):
             pass
         elif isinstance(frame, LLMContextFrame):
-            await self._handle_context(frame.context)
+            await self._handle_context(frame.context, direction)
         elif isinstance(frame, InputAudioRawFrame):
             if not self._audio_input_paused:
                 await self._send_user_audio(frame)
@@ -531,7 +630,73 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         await self.push_frame(frame, direction)
 
-    async def _handle_context(self, context: LLMContext):
+    async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
+        """Push a frame, delivering function call outcomes to the API on the way.
+
+        Function call results and cancellations are broadcast by the base
+        service; the downstream copy is observed here and sent to the API as it
+        is produced, intermediate results included. The frames travel on to the
+        assistant aggregator, which records them in the context and decides when
+        inference should run.
+
+        Args:
+            frame: The frame to push.
+            direction: The direction of frame pushing.
+        """
+        if direction == FrameDirection.DOWNSTREAM:
+            if isinstance(frame, FunctionCallResultFrame):
+                await self._handle_function_call_result(frame)
+            elif isinstance(frame, FunctionCallCancelFrame):
+                await self._handle_function_call_cancel(frame)
+        await super().push_frame(frame, direction)
+
+    async def _handle_function_call_result(self, frame: FunctionCallResultFrame):
+        """Send one function call result to the API as it is produced.
+
+        An intermediate result can't go through the tool-result channel — the
+        API takes one output per call — so it goes in as a message carrying the
+        same envelope a text LLM would read from the context. A final result
+        answers the call, unless a reconnect has left the API without the id to
+        answer, in which case it goes in as a message too.
+        """
+        result = (
+            json.dumps(frame.result, ensure_ascii=False)
+            if frame.result is not None
+            else "COMPLETED"
+        )
+        is_final = frame.properties.is_final if frame.properties else True
+
+        if not is_final:
+            message = async_tool_messages.build_intermediate_result_message(
+                frame.tool_call_id, result
+            )
+            await self._send_message_item(cast(str, message.get("content", "")))
+        elif frame.tool_call_id in self._open_function_calls:
+            await self._send_tool_result(frame.tool_call_id, result)
+        else:
+            message = async_tool_messages.build_final_result_message(frame.tool_call_id, result)
+            await self._send_message_item(cast(str, message.get("content", "")))
+
+        self._completed_tool_calls.add(frame.tool_call_id)
+        self._results_awaiting_response = True
+
+    async def _handle_function_call_cancel(self, frame: FunctionCallCancelFrame):
+        """Settle a cancelled call, so the API isn't left waiting on it."""
+        if frame.tool_call_id not in self._open_function_calls:
+            return
+        await self._send_tool_result(frame.tool_call_id, "CANCELLED")
+        self._completed_tool_calls.add(frame.tool_call_id)
+
+    async def _send_message_item(self, text: str, role: str = "user"):
+        """Put text into the conversation for the model to take in, without answering it."""
+        item = events.ConversationItem(
+            type="message",
+            role=role,  # type: ignore[arg-type]
+            content=[events.ItemContent(type="input_text", text=text)],
+        )
+        await self.send_client_event(events.ConversationItemCreateEvent(item=item))
+
+    async def _handle_context(self, context: LLMContext, direction: FrameDirection):
         """Handle LLM context updates."""
         if not self._context:
             self._context = context
@@ -540,10 +705,34 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         else:
             self._context = context
             await self._process_completed_function_calls(send_new_results=True)
+            # A context frame travelling upstream comes from the assistant
+            # aggregator, which is asking the model to respond to what was
+            # delivered since its last response.
+            if direction == FrameDirection.UPSTREAM and self._results_awaiting_response:
+                await self._create_response()
 
-    async def _handle_messages_append(self, frame):
-        """Handle appending messages to the context."""
-        logger.warning("LLMMessagesAppendFrame not yet implemented for Grok Realtime")
+    async def _handle_messages_append(self, frame: LLMMessagesAppendFrame):
+        """Put appended messages into the conversation as items, for the model to take in.
+
+        Whether the model answers them is the aggregator's call: an append
+        that asks to run comes back to this service as the context frame the
+        assistant aggregator pushes upstream, which creates the response (see
+        :meth:`_handle_context`). Before the session's conversation is set up,
+        nothing is sent: the setup sends the context, which the aggregator
+        records the messages in.
+
+        The messages are taken from this frame, not read from the context.
+        ``LLMUserAggregator._realtime_handle_messages_append`` explains why.
+        """
+        if not self._api_session_ready or self._llm_needs_conversation_setup:
+            return
+        for message in frame.messages:
+            text = standard_message_text(message)
+            if not text:
+                continue
+            role = message.get("role") if isinstance(message, dict) else None
+            await self._send_message_item(text, role="assistant" if role == "assistant" else "user")
+        self._results_awaiting_response = True
 
     #
     # WebSocket communication
@@ -566,6 +755,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             # Model is selected via query param at connection time; xAI does
             # not support changing it via session.update.
             model = assert_given(self._settings.model)
+            # The service is constructed with a model and the URL needs one.
+            assert model is not None
             uri = f"{self.base_url}?model={quote(model, safe='')}"
 
             self._websocket = await websocket_connect(
@@ -584,6 +775,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         try:
             self._disconnecting = True
             self._api_session_ready = False
+            self._logged_audio_drop_before_session_ready = False
             await self.stop_all_metrics()
 
             if self._websocket:
@@ -595,6 +787,11 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 self._receive_task = None
 
             self._completed_tool_calls = set()
+            # A new session knows none of the old call ids, and no response is
+            # running in it.
+            self._open_function_calls = set()
+            self._response_active = False
+            self._response_create_owed = False
             self._disconnecting = False
         except Exception as e:
             await self.push_error(error_msg=f"Error disconnecting: {e}", exception=e)
@@ -636,23 +833,25 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         adapter = self.get_llm_adapter()
 
         if self._context:
-            llm_invocation_params = adapter.get_llm_invocation_params(
+            llm_invocation_params = await adapter.get_llm_invocation_params(
                 self._context,
                 system_instruction=assert_given(self._settings.system_instruction),
+                service_tools=settings.tools,
             )
-
-            # tools given in the context override the tools in the session properties
-            if llm_invocation_params["tools"]:
-                settings.tools = llm_invocation_params["tools"]
 
             # The adapter resolves conflicts between init-provided and
             # context-provided system instructions (preferring init-provided).
             if llm_invocation_params["system_instruction"]:
                 settings.instructions = llm_invocation_params["system_instruction"]
 
-        # Convert ToolsSchema to list of dicts if needed
-        if settings.tools and isinstance(settings.tools, ToolsSchema):
-            settings.tools = adapter.from_standard_tools(settings.tools)
+            # The adapter settles the tools too: the context's own when it has
+            # any, else the init-provided ones; built-in tools ride along either way.
+            settings.tools = cast(list[events.GrokTool], llm_invocation_params["tools"])
+        else:
+            # No context yet: the init-provided tools; built-in tools ride along.
+            settings.tools = cast(
+                list[events.GrokTool], adapter.from_standard_tools(settings.tools)
+            )
 
         await self.send_client_event(events.SessionUpdateEvent(session=settings))
 
@@ -662,6 +861,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _receive_task_handler(self):
         """Handle incoming WebSocket messages."""
+        assert self._websocket is not None
+
         async for message in self._websocket:
             try:
                 evt = events.parse_server_event(message)
@@ -672,6 +873,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             if evt.type == "ping":
                 # Ignore ping events (keep-alive)
                 pass
+            elif evt.type == "session.created":
+                await self._handle_evt_session_created(evt)
             elif evt.type == "conversation.created":
                 await self._handle_evt_conversation_created(evt)
             elif evt.type == "session.updated":
@@ -682,19 +885,20 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 await self._handle_evt_audio_delta(evt)
             elif evt.type == "response.output_audio.done":
                 await self._handle_evt_audio_done(evt)
-            elif evt.type == "response.content_part.added":
-                # Content part added - we can ignore this for now
-                pass
-            elif evt.type == "response.content_part.done":
-                # Content part done - we can ignore this for now
+            elif evt.type in ("response.content_part.added", "response.content_part.done"):
                 pass
             elif evt.type == "response.output_item.added":
                 await self._handle_evt_conversation_item_added(evt)
             elif evt.type == "response.output_item.done":
-                # Output item done - we can ignore this for now
                 pass
             elif evt.type == "conversation.item.added":
                 await self._handle_evt_conversation_item_added(evt)
+            elif evt.type == "conversation.item.deleted":
+                await self._handle_evt_conversation_item_deleted(evt)
+            elif evt.type == "conversation.item.truncated":
+                await self._handle_evt_conversation_item_truncated(evt)
+            elif evt.type == "conversation.item.input_audio_transcription.updated":
+                await self._handle_evt_input_audio_transcription_updated(evt)
             elif evt.type == "conversation.item.input_audio_transcription.completed":
                 await self._handle_evt_input_audio_transcription_completed(evt)
             elif evt.type == "response.done":
@@ -703,13 +907,27 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 await self._handle_evt_speech_started(evt)
             elif evt.type == "input_audio_buffer.speech_stopped":
                 await self._handle_evt_speech_stopped(evt)
+            elif evt.type == "input_audio_buffer.committed":
+                pass
+            elif evt.type == "input_audio_buffer.cleared":
+                pass
+            elif evt.type == "input_audio_buffer.timeout_triggered":
+                await self._handle_evt_timeout_triggered(evt)
+            elif evt.type == "input_audio_buffer.dtmf_event_received":
+                await self._handle_evt_dtmf_received(evt)
             elif evt.type == "response.output_audio_transcript.delta":
                 await self._handle_evt_audio_transcript_delta(evt)
+            elif evt.type == "response.output_audio_transcript.done":
+                pass
+            elif evt.type in ("response.output_text.delta", "response.text.delta"):
+                await self._handle_evt_text_delta(evt)
             elif evt.type == "response.function_call_arguments.delta":
                 # Function call arguments streaming - we wait for the .done event
                 pass
             elif evt.type == "response.function_call_arguments.done":
                 await self._handle_evt_function_call_arguments_done(evt)
+            elif evt.type.startswith("mcp_list_tools.") or evt.type.startswith("response.mcp_call"):
+                await self._handle_evt_mcp(evt)
             elif evt.type == "error":
                 # Match Grok's actual codes/messages for cancel-not-active
                 # and already-active. Grok's error codes diverge from
@@ -727,26 +945,76 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                     )
                     or "no active response" in msg
                     or "already has an active response" in msg
+                    or "truncat" in msg
                 ):
                     logger.debug(f"{self} {evt.error.message}")
                 else:
                     await self._handle_evt_error(evt)
                     return
 
+    async def _handle_evt_session_created(self, evt):
+        """Record the server session snapshot; config is sent on conversation.created."""
+        self._session_id = getattr(evt.session, "id", None) or self._session_id
+
     async def _handle_evt_conversation_created(self, evt):
-        """Handle conversation.created event - first event after connecting."""
+        """Handle conversation.created — send the initial session update."""
+        self._conversation_id = evt.conversation.id
         await self._send_session_update()
 
     async def _handle_evt_response_created(self, evt):
         """Handle response.created event - response generation started."""
-        pass
+        self._current_response_id = evt.response.id if evt.response else None
+        # The response takes in everything delivered before it.
+        self._response_active = True
+        self._results_awaiting_response = False
 
     async def _handle_evt_session_updated(self, evt):
         """Handle session.updated event."""
+        if getattr(evt.session, "id", None):
+            self._session_id = evt.session.id
         self._api_session_ready = True
         if self._run_llm_when_api_session_ready:
             self._run_llm_when_api_session_ready = False
             await self._create_response()
+
+    async def _handle_evt_conversation_item_deleted(self, evt):
+        """Handle conversation.item.deleted confirmation."""
+        await self._call_event_handler("on_conversation_item_deleted", evt.item_id)
+
+    async def _handle_evt_conversation_item_truncated(self, evt):
+        """Handle conversation.item.truncated confirmation."""
+        await self._call_event_handler(
+            "on_conversation_item_truncated",
+            evt.item_id,
+            evt.content_index,
+            evt.audio_end_ms,
+        )
+
+    async def _handle_evt_timeout_triggered(self, evt):
+        """Handle idle timeout — server starts a proactive check-in response."""
+        logger.debug(f"{self} Idle timeout triggered; server will check in")
+        await self._call_event_handler("on_idle_timeout", evt.item_id)
+        await self.start_ttfb_metrics()
+        await self.start_processing_metrics()
+
+    async def _handle_evt_dtmf_received(self, evt):
+        """Push SIP DTMF digits into the pipeline as InputDTMFFrame."""
+        digit = getattr(evt, "digit", None)
+        if not digit:
+            return
+        try:
+            button = KeypadEntry(digit)
+        except ValueError:
+            logger.warning(f"{self} Ignoring unsupported DTMF digit: {digit!r}")
+            return
+        await self._call_event_handler("on_dtmf_received", button)
+        await self.push_frame(InputDTMFFrame(button=button), FrameDirection.UPSTREAM)
+
+    async def _handle_evt_mcp(self, evt):
+        """Handle MCP discovery / call lifecycle events."""
+        await self._call_event_handler("on_mcp_event", evt.type, evt)
+        if evt.type.endswith(".failed"):
+            await self.push_error(error_msg=f"Grok Realtime MCP failure: {evt.type}")
 
     async def _handle_evt_audio_delta(self, evt):
         """Handle audio delta event - streaming audio from assistant."""
@@ -796,6 +1064,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._current_assistant_response = evt.item
             await self.push_frame(LLMFullResponseStartFrame())
 
+    async def _handle_evt_input_audio_transcription_updated(self, evt):
+        """Handle cumulative streaming user transcription (grok-transcribe)."""
+        transcript = evt.transcript.strip() if evt.transcript else ""
+        if transcript:
+            await self.push_frame(
+                InterimTranscriptionFrame(transcript, "", time_now_iso8601(), result=evt),
+                FrameDirection.UPSTREAM,
+            )
+
     async def _handle_evt_input_audio_transcription_completed(self, evt):
         """Handle input audio transcription completed event."""
         await self._call_event_handler("on_conversation_item_updated", evt.item_id, None)
@@ -810,6 +1087,14 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _handle_evt_response_done(self, evt):
         """Handle response.done event."""
+        self._response_active = False
+        # A response asked for while this one was running is owed now, unless
+        # this one took in what it was for.
+        if self._response_create_owed:
+            self._response_create_owed = False
+            if self._results_awaiting_response:
+                await self._create_response()
+
         # Usage metrics - check both response.usage and top-level usage
         usage = evt.usage or evt.response.usage
         if usage and usage.total_tokens:
@@ -823,6 +1108,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         await self.stop_processing_metrics()
         await self.push_frame(LLMFullResponseEndFrame())
         self._current_assistant_response = None
+        self._current_response_id = None
 
         # Error handling
         if evt.response.status == "failed":
@@ -841,6 +1127,12 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if evt.delta:
             await self._push_output_transcript_text_frames(evt.delta)
 
+    async def _handle_evt_text_delta(self, evt):
+        """Handle text-mode output deltas (``response.*.text.delta``)."""
+        if evt.delta:
+            frame = LLMTextFrame(evt.delta)
+            await self.push_frame(frame)
+
     async def _push_output_transcript_text_frames(self, text: str):
         # In a typical "cascade" LLM + TTS setup, LLMTextFrames would not
         # proceed beyond the TTS service. Therefore, since a speech-to-speech
@@ -856,7 +1148,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         await self.push_frame(llm_text_frame)
 
         # Push TTSTextFrame
-        tts_text_frame = TTSTextFrame(text, aggregated_by=AggregationType.SENTENCE)
+        tts_text_frame = TTSTextFrame(text, text_type=TextType.SENTENCE)
         tts_text_frame.includes_inter_frame_spaces = True
         await self.push_frame(tts_text_frame)
 
@@ -868,6 +1160,10 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             function_call_item = self._pending_function_calls.get(evt.call_id)
             if function_call_item:
                 del self._pending_function_calls[evt.call_id]
+
+                # The API is waiting on this call now, so its id can be answered
+                # with a function_call_output.
+                self._open_function_calls.add(evt.call_id)
 
                 function_calls = [
                     FunctionCallFromLLM(
@@ -892,9 +1188,9 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             # In local turn detection mode, the client is responsible for broadcasting user turn frames
             return
 
+        self._response_create_owed = False
         await self._truncate_current_audio_response()
-        await self.broadcast_frame(UserStartedSpeakingFrame)
-        await self.broadcast_interruption()
+        await self.broadcast_frame(ProposedUserStartedSpeakingFrame)
 
     async def _handle_evt_speech_stopped(self, evt):
         """Handle speech stopped event from VAD."""
@@ -904,7 +1200,7 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
         await self.start_ttfb_metrics()
         await self.start_processing_metrics()
-        await self.broadcast_frame(UserStoppedSpeakingFrame)
+        await self.broadcast_frame(ProposedUserStoppedSpeakingFrame)
 
     async def _handle_evt_error(self, evt):
         """Handle error event."""
@@ -930,15 +1226,21 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._run_llm_when_api_session_ready = True
             return
 
+        if self._response_active:
+            # The API refuses a second response while one is running. Hold this
+            # one for response.done rather than losing it to that error.
+            logger.debug("Response already active — holding the next one until it is done")
+            self._response_create_owed = True
+            return
+
+        assert self._context is not None
+
         adapter = self.get_llm_adapter()
 
         if self._llm_needs_conversation_setup:
-            logger.debug(
-                f"Setting up Grok conversation with initial messages: "
-                f"{adapter.get_messages_for_logging(self._context)}"
-            )
+            self._log_llm_conversation_setup(self._context)
 
-            llm_invocation_params = adapter.get_llm_invocation_params(self._context)
+            llm_invocation_params = await adapter.get_llm_invocation_params(self._context)
             messages = llm_invocation_params["messages"]
 
             for item in messages:
@@ -950,6 +1252,9 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             self._llm_needs_conversation_setup = False
 
         logger.debug("Creating Grok response")
+        # Active from the moment the create is sent, not from response.created: a
+        # second create in between would be refused by the API.
+        self._response_active = True
 
         await self.push_frame(LLMFullResponseStartFrame())
         await self.start_processing_metrics()
@@ -962,8 +1267,14 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         )
 
     async def _process_completed_function_calls(self, send_new_results: bool):
-        """Process completed function calls and send results to the service."""
-        sent_new_result = False
+        """Send any tool result the context holds that hasn't reached the API yet.
+
+        Results this service produced are already sent, as they are produced
+        (see :meth:`push_frame`), so what this finds is a result written into
+        the context some other way, plus, with ``send_new_results=False``, the
+        results a context brings with it at the start of a session.
+        """
+        assert self._context is not None
 
         for message in self._context.get_messages():
             # LLMSpecificMessages are opaque provider-specific payloads, not
@@ -983,22 +1294,14 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                     # awaits a result; nothing to send for the started marker.
                     continue
                 if async_payload.kind == "intermediate":
-                    logger.error(
-                        f"{self}: Grok Realtime does not support streamed async "
-                        f"tool results; dropping intermediate result for "
-                        f"tool_call_id={async_payload.tool_call_id}. Use a "
-                        f"non-realtime LLM service if your tool needs to "
-                        f"stream intermediate results."
-                    )
-                    await self.push_error(
-                        error_msg="Grok Realtime does not support streamed async tool results.",
-                    )
+                    # Sent as a message when it was produced; the call stays
+                    # open for the final result.
                     continue
                 if async_payload.kind == "final":
                     # Deliver via the formal tool-result channel — same path
                     # as a synchronous tool result, just delayed.
                     if send_new_results:
-                        sent_new_result = True
+                        self._results_awaiting_response = True
                         await self._send_tool_result(
                             async_payload.tool_call_id, async_payload.result
                         )
@@ -1014,29 +1317,36 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 tool_call_id = message.get("tool_call_id")
                 if tool_call_id and tool_call_id not in self._completed_tool_calls:
                     if send_new_results:
-                        sent_new_result = True
-                        await self._send_tool_result(tool_call_id, message.get("content"))
+                        self._results_awaiting_response = True
+                        await self._send_tool_result(
+                            tool_call_id, cast(str | None, message.get("content"))
+                        )
                     self._completed_tool_calls.add(tool_call_id)
 
-        if sent_new_result:
-            await self._create_response()
-
     async def _send_user_audio(self, frame):
-        """Send user audio to Grok."""
-        # Don't send audio if conversation setup is still pending, as it can
-        # lead to errors. For example: audio sent before conversation setup
-        # will be interpreted as having Grok's default sample rate (24000),
-        # and if that differs from the sample rate we eventually set through
-        # the conversation setup, Grok will error out.
-        if self._llm_needs_conversation_setup:
+        """Send user audio to Grok.
+
+        Audio is gated on ``_api_session_ready`` (set after ``session.updated``),
+        once the session sample rate has been applied. Conversation seeding
+        (``_llm_needs_conversation_setup``) is independent so audio-only
+        pipelines can stream without calling ``_create_response``.
+        """
+        if not self._api_session_ready:
+            if not self._logged_audio_drop_before_session_ready:
+                self._logged_audio_drop_before_session_ready = True
+                logger.debug(
+                    f"{self} Dropping user audio; realtime session is not ready yet "
+                    "(waiting for session.updated)"
+                )
             return
 
         payload = base64.b64encode(frame.audio).decode("utf-8")
         await self.send_client_event(events.InputAudioBufferAppendEvent(audio=payload))
 
-    async def _send_tool_result(self, tool_call_id: str, result: str):
+    async def _send_tool_result(self, tool_call_id: str, result: str | None):
         """Send a tool call result to Grok."""
         logger.debug(f"Sending tool result to Grok Realtime for tool_call_id={tool_call_id}")
+        self._open_function_calls.discard(tool_call_id)
         item = events.ConversationItem(
             type="function_call_output",
             call_id=tool_call_id,

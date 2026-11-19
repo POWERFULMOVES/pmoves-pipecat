@@ -17,7 +17,6 @@ https://docs.api.nvidia.com/nim/reference/llm-apis
 import inspect
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from enum import StrEnum
 
 from loguru import logger
 from openai.types.chat import ChatCompletionChunk
@@ -27,19 +26,14 @@ from pipecat.frames.frames import (
     LLMThoughtStartFrame,
     LLMThoughtTextFrame,
 )
-from pipecat.metrics.metrics import LLMTokenUsage
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openai.base_llm import BaseOpenAILLMService
 from pipecat.services.openai.llm import OpenAILLMService
-
-_THINK_OPEN = "<think>"
-_THINK_CLOSE = "</think>"
-
-
-class _ThinkTagState(StrEnum):
-    DETECTING = "detecting"
-    IN_THOUGHT = "in_thought"
-    CONTENT = "content"
+from pipecat.utils.text.tagged_llm_text_parser import (
+    TaggedLLMTextParsedOutputChunk,
+    TaggedLLMTextParsedOutputChunkKind,
+    TaggedLLMTextParser,
+)
 
 
 @dataclass
@@ -55,8 +49,6 @@ class NvidiaLLMService(OpenAILLMService):
     This service extends OpenAILLMService to work with NVIDIA's NIM API while
     maintaining compatibility with the OpenAI-style interface. It handles:
 
-    - Incremental token usage reporting (NIM sends per-chunk counts instead
-      of a final summary)
     - Detection and filtering of leading ``<think>``/``</think>`` content for
       models that emit reasoning inline before visible output (e.g.
       DeepSeek-R1, some nemotron models)
@@ -87,7 +79,7 @@ class NvidiaLLMService(OpenAILLMService):
             base_url: The base URL for NIM API. Defaults to NVIDIA's cloud endpoint.
                 For local deployments, pass the local address (e.g. ``http://localhost:8000/v1``).
             model: The model identifier to use. Defaults to
-                "nvidia/nemotron-3-nano-30b-a3b".
+                "nvidia/nemotron-3.5-super-vl-120b-a12b".
 
                 .. deprecated:: 0.0.105
                     Use ``settings=NvidiaLLMService.Settings(model=...)`` instead.
@@ -98,7 +90,7 @@ class NvidiaLLMService(OpenAILLMService):
             **kwargs: Additional keyword arguments passed to OpenAILLMService.
         """
         # 1. Initialize default_settings with hardcoded defaults
-        default_settings = self.Settings(model="nvidia/nemotron-3-nano-30b-a3b")
+        default_settings = self.Settings(model="nvidia/nemotron-3.5-super-vl-120b-a12b")
 
         # 2. Apply direct init arg overrides (deprecated)
         if model is not None:
@@ -111,7 +103,14 @@ class NvidiaLLMService(OpenAILLMService):
         if settings is not None:
             default_settings.apply_update(settings)
 
-        super().__init__(api_key=api_key, base_url=base_url, settings=default_settings, **kwargs)
+        # Local NIM takes no key, but the OpenAI client needs one: given None it
+        # would fall back to OPENAI_API_KEY and send it to NVIDIA.
+        super().__init__(
+            api_key=api_key or "not-needed",
+            base_url=base_url,
+            settings=default_settings,
+            **kwargs,
+        )
 
         if "api.nvidia.com" in base_url and not api_key:
             logger.warning(
@@ -120,20 +119,13 @@ class NvidiaLLMService(OpenAILLMService):
                 "Set base_url to your local NIM endpoint for local deployments."
             )
 
-        # NVIDIA repeats a cumulative usage snapshot on every streamed chunk, so
-        # the latest one holds the totals for the whole completion.
-        self._token_usage: LLMTokenUsage | None = None
-
     def _reset_response_state(self):
         """Reset per-response state at the start of each LLM call.
 
-        Resets the held token usage, leading-think-tag detection state, and
-        reasoning-content field tracking.
+        Resets leading-think-tag detection state and reasoning-content field
+        tracking.
         """
-        self._token_usage = None
-
-        self._think_tag_state = _ThinkTagState.DETECTING
-        self._think_tag_buffer = ""
+        self._think_parser = TaggedLLMTextParser("<think>", "</think>")
 
         # reasoning_content field tracking
         self._has_reasoning_field = False
@@ -141,20 +133,10 @@ class NvidiaLLMService(OpenAILLMService):
     async def _filter_thinking_content(self, text: str) -> str | None:
         """Filter leading ``<think>`` tags from content and emit thought frames.
 
-        Uses a three-state machine optimized for the common provider pattern
-        where a response either begins with a ``<think>`` block or contains no
-        think tags at all. It returns only visible content to the base OpenAI
-        processing loop while emitting hidden reasoning as ``LLMThought*Frame``
-        side effects.
-
-        - ``detecting``: Buffers the start of the stream to check for
-          ``<think>``.
-        - ``in_thought``: Inside a leading think block; emits
-          ``LLMThoughtTextFrame`` until ``</think>`` is found.
-        - ``content``: Normal content; passthrough.
-
-        Non-reasoning models transition from ``detecting`` to ``content``
-        on the first chunk with zero buffering overhead after that.
+        Returns only visible content to the base OpenAI processing loop while
+        emitting a leading ``<think>`` block as ``LLMThought*Frame`` side
+        effects. Responses without one pass through from the first chunk that
+        rules it out.
 
         Args:
             text: The text content from the LLM to filter.
@@ -163,51 +145,14 @@ class NvidiaLLMService(OpenAILLMService):
             The non-reasoning content that should continue through the base
             OpenAI content path, or ``None`` if this chunk should not emit
             normal content.
-
         """
-        if self._think_tag_state == _ThinkTagState.CONTENT:
-            return text
-
-        self._think_tag_buffer += text
-
-        if self._think_tag_state == _ThinkTagState.DETECTING:
-            if len(self._think_tag_buffer) < len(_THINK_OPEN):
-                if _THINK_OPEN.startswith(self._think_tag_buffer):
-                    return None
-                self._think_tag_state = _ThinkTagState.CONTENT
-                passthrough = self._think_tag_buffer
-                self._think_tag_buffer = ""
-                return passthrough
-
-            if self._think_tag_buffer.startswith(_THINK_OPEN):
-                self._think_tag_state = _ThinkTagState.IN_THOUGHT
-                await self.push_frame(LLMThoughtStartFrame())
-                self._think_tag_buffer = self._think_tag_buffer[len(_THINK_OPEN) :]
+        visible = ""
+        for chunk in self._think_parser.parse_next_chunk(text):
+            if chunk.kind == TaggedLLMTextParsedOutputChunkKind.TEXT:
+                visible += chunk.text
             else:
-                self._think_tag_state = _ThinkTagState.CONTENT
-                passthrough = self._think_tag_buffer
-                self._think_tag_buffer = ""
-                return passthrough
-
-        if self._think_tag_state == _ThinkTagState.IN_THOUGHT:
-            idx = self._think_tag_buffer.find(_THINK_CLOSE)
-            if idx != -1:
-                thought = self._think_tag_buffer[:idx]
-                if thought:
-                    await self.push_frame(LLMThoughtTextFrame(text=thought))
-                await self.push_frame(LLMThoughtEndFrame())
-                remainder = self._think_tag_buffer[idx + len(_THINK_CLOSE) :]
-                self._think_tag_buffer = ""
-                self._think_tag_state = _ThinkTagState.CONTENT
-                return remainder or None
-            else:
-                safe_end = len(self._think_tag_buffer) - len(_THINK_CLOSE) + 1
-                if safe_end > 0:
-                    await self.push_frame(
-                        LLMThoughtTextFrame(text=self._think_tag_buffer[:safe_end])
-                    )
-                    self._think_tag_buffer = self._think_tag_buffer[safe_end:]
-        return None
+                await self._push_thought_chunk(chunk)
+        return visible or None
 
     async def _finalize_reasoning_state(self, *, flush_buffered_text: bool):
         """Finalize buffered reasoning state at stream end.
@@ -219,23 +164,26 @@ class NvidiaLLMService(OpenAILLMService):
                 when the stream ends early due to interruption or
                 cancellation.
         """
-        if self._think_tag_state == _ThinkTagState.IN_THOUGHT:
-            if self._think_tag_buffer and flush_buffered_text:
-                await self.push_frame(LLMThoughtTextFrame(text=self._think_tag_buffer))
-            await self.push_frame(LLMThoughtEndFrame())
-        elif (
-            self._think_tag_state == _ThinkTagState.DETECTING
-            and self._think_tag_buffer
-            and flush_buffered_text
-        ):
-            await super()._push_llm_text(self._think_tag_buffer)
-
-        self._think_tag_buffer = ""
-        self._think_tag_state = _ThinkTagState.CONTENT
+        chunks = self._think_parser.flush() if flush_buffered_text else self._think_parser.reset()
+        for chunk in chunks:
+            if chunk.kind == TaggedLLMTextParsedOutputChunkKind.TEXT:
+                await super()._push_llm_text(chunk.text)
+            else:
+                await self._push_thought_chunk(chunk)
 
         if self._has_reasoning_field:
             await self.push_frame(LLMThoughtEndFrame())
             self._has_reasoning_field = False
+
+    async def _push_thought_chunk(self, chunk: TaggedLLMTextParsedOutputChunk):
+        """Push a piece of a ``<think>`` block as a thought frame."""
+        if chunk.kind == TaggedLLMTextParsedOutputChunkKind.THOUGHT_START:
+            await self.stop_ttfb_metrics()
+            await self.push_frame(LLMThoughtStartFrame())
+        elif chunk.kind == TaggedLLMTextParsedOutputChunkKind.THOUGHT_TEXT:
+            await self.push_frame(LLMThoughtTextFrame(text=chunk.text))
+        elif chunk.kind == TaggedLLMTextParsedOutputChunkKind.THOUGHT_END:
+            await self.push_frame(LLMThoughtEndFrame())
 
     async def get_chat_completions(self, context: LLMContext) -> AsyncIterator[ChatCompletionChunk]:
         """Wrap the chat completion stream to handle ``reasoning_content``.
@@ -296,6 +244,7 @@ class NvidiaLLMService(OpenAILLMService):
                     )
                     if rc:
                         if not self._has_reasoning_field:
+                            await self.stop_ttfb_metrics()
                             self._has_reasoning_field = True
                             await self.push_frame(LLMThoughtStartFrame())
                         await self.push_frame(LLMThoughtTextFrame(text=rc))
@@ -336,40 +285,16 @@ class NvidiaLLMService(OpenAILLMService):
             )
 
     async def _process_context(self, context: LLMContext):
-        """Process a context through the LLM and accumulate token usage metrics.
+        """Process a context through the LLM.
 
-        Delegates to the base OpenAI streaming loop while adding
-        NVIDIA-specific behavior:
-
-        - ``reasoning_content`` and leading ``<think>`` content are
-          intercepted via the ``get_chat_completions`` stream wrapper and
-          emitted as
-          ``LLMThought*Frame`` objects.
-        - Token usage is reported once per completion rather than per chunk.
+        Delegates to the base OpenAI streaming loop, resetting the per-response
+        state it needs to emit ``LLMThought*Frame`` objects for
+        ``reasoning_content`` and leading ``<think>`` content, which the
+        ``get_chat_completions`` stream wrapper intercepts.
 
         Args:
             context: The context to process, containing messages and other
                 information needed for the LLM interaction.
         """
         self._reset_response_state()
-
-        try:
-            await super()._process_context(context)
-        finally:
-            # Only the base implementation emits the metrics; report through it
-            # even if the response is interrupted or cancelled mid-stream.
-            if self._token_usage:
-                await super().start_llm_usage_metrics(self._token_usage)
-                self._token_usage = None
-
-    async def start_llm_usage_metrics(self, tokens: LLMTokenUsage):
-        """Hold the latest usage snapshot rather than reporting it.
-
-        The inherited streaming loop calls this for every chunk carrying usage.
-        Holding the snapshot here suppresses that per-chunk reporting, leaving
-        :meth:`_process_context` to report the final one when the completion ends.
-
-        Args:
-            tokens: Cumulative token usage for the completion so far.
-        """
-        self._token_usage = tokens
+        await super()._process_context(context)
