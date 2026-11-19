@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024-2025 Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.extensions.ivr.ivr_navigator import IVRProcessor
 from pipecat.frames.frames import (
+    AggregatedTextFrame,
+    InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMMessagesUpdateFrame,
     LLMTextFrame,
@@ -18,7 +20,7 @@ from pipecat.frames.frames import (
     VADParamsUpdateFrame,
 )
 from pipecat.services.llm_service import LLMService
-from pipecat.tests.utils import run_test
+from pipecat.tests.utils import SleepFrame, run_test
 
 
 class TestIVRNavigation(unittest.IsolatedAsyncioTestCase):
@@ -339,7 +341,7 @@ class TestIVRNavigation(unittest.IsolatedAsyncioTestCase):
         ]
 
         expected_down_frames = [
-            LLMTextFrame,  # Should pass through unchanged
+            AggregatedTextFrame,  # LLMTextFrames aggregrated and converted to AggregatedTextFrame
             LLMFullResponseEndFrame,
         ]
 
@@ -353,3 +355,34 @@ class TestIVRNavigation(unittest.IsolatedAsyncioTestCase):
             expected_down_frames=expected_down_frames,
             expected_up_frames=expected_up_frames,
         )
+
+    async def test_interruption_discards_partial_response(self):
+        """Text and an open tag from an interrupted response don't leak into the next one."""
+        processor = IVRProcessor(
+            classifier_prompt=self.classifier_prompt,
+            ivr_prompt=self.ivr_prompt,
+            ivr_vad_params=self.ivr_vad_params,
+        )
+
+        down_frames, _ = await run_test(
+            processor,
+            frames_to_send=[
+                LLMTextFrame(text="<dtmf>"),
+                SleepFrame(sleep=0.1),
+                InterruptionFrame(),
+                SleepFrame(sleep=0.1),
+                LLMTextFrame(text="Yes."),
+                LLMFullResponseEndFrame(),
+            ],
+            expected_down_frames=[
+                InterruptionFrame,
+                AggregatedTextFrame,
+                LLMFullResponseEndFrame,
+            ],
+        )
+
+        self.assertEqual(down_frames[1].text, "Yes.")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -12,7 +12,6 @@ models that support web search and fact grounding capabilities.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 from pipecat.frames.frames import DataFrame
 
@@ -22,12 +21,13 @@ class LLMSearchResult:
     """Represents a single search result with confidence scores.
 
     Parameters:
-        text: The search result text content.
-        confidence: List of confidence scores associated with the result.
+        text: A part of the answer that the site supports.
+        confidence: How confident the LLM is in each site this part of the answer
+            cites, from 0 to 1, one score per site.
     """
 
     text: str
-    confidence: List[float] = field(default_factory=list)
+    confidence: list[float] = field(default_factory=list)
 
 
 @dataclass
@@ -37,12 +37,12 @@ class LLMSearchOrigin:
     Parameters:
         site_uri: URI of the source website.
         site_title: Title of the source website.
-        results: List of search results from this origin.
+        results: The parts of the answer this site supports.
     """
 
-    site_uri: Optional[str] = None
-    site_title: Optional[str] = None
-    results: List[LLMSearchResult] = field(default_factory=list)
+    site_uri: str | None = None
+    site_title: str | None = None
+    results: list[LLMSearchResult] = field(default_factory=list)
 
 
 @dataclass
@@ -60,9 +60,9 @@ class LLMSearchResponseFrame(DataFrame):
         origins: List of search result origins with detailed information.
     """
 
-    search_result: Optional[str] = None
-    rendered_content: Optional[str] = None
-    origins: List[LLMSearchOrigin] = field(default_factory=list)
+    search_result: str | None = None
+    rendered_content: str | None = None
+    origins: list[LLMSearchOrigin] = field(default_factory=list)
 
     def __str__(self):
         """Return string representation of the search response frame.

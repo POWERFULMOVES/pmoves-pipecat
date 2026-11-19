@@ -1,14 +1,22 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 #
 
-"""NVIDIA Riva Speech-to-Text service implementations for real-time and batch transcription."""
+"""NVIDIA Nemotron Speech-to-Text service implementations for real-time and batch transcription.
+
+Refer to the NVIDIA ASR NIM documentation for usage, customization,
+and local deployment steps:
+https://docs.nvidia.com/nim/speech/latest/asr/
+"""
 
 import asyncio
+from collections.abc import AsyncGenerator, Mapping
 from concurrent.futures import CancelledError as FuturesCancelledError
-from typing import AsyncGenerator, List, Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, ClassVar, TypeVar, cast
 
 from loguru import logger
 from pydantic import BaseModel
@@ -22,31 +30,41 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
+from pipecat.processors.frame_processor import FrameProcessorSetup
+from pipecat.services.settings import STTSettings
+from pipecat.services.stt_latency import NVIDIA_TTFS_P99
 from pipecat.services.stt_service import SegmentedSTTService, STTService
 from pipecat.transcriptions.language import Language, resolve_language
+from pipecat.utils.deprecation import deprecated, warn_deprecated
 from pipecat.utils.time import time_now_iso8601
 from pipecat.utils.tracing.service_decorators import traced_stt
+from pipecat.utils.types import NOT_GIVEN, NotGiven, assert_given, is_given
 
 try:
+    import grpc
     import riva.client
 
 except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
-    logger.error("In order to use NVIDIA Riva STT, you need to `pip install pipecat-ai[nvidia]`.")
-    raise Exception(f"Missing module: {e}")
+    logger.error(
+        'In order to use NVIDIA Nemotron Speech STT, you need to `uv add "pipecat-ai[nvidia]"`.'
+    )
+    raise ImportError(f"Missing module: {e}") from e
 
 
-def language_to_nvidia_riva_language(language: Language) -> Optional[str]:
-    """Maps Language enum to NVIDIA Riva ASR language codes.
+def language_to_nvidia_nemotron_speech_language(language: Language) -> str:
+    """Maps Language enum to NVIDIA Nemotron Speech ASR language codes.
 
     Source:
-    https://docs.nvidia.com/deeplearning/riva/user-guide/docs/asr/asr-riva-build-table.html?highlight=fr%20fr
+    https://docs.nvidia.com/nim/speech/latest/reference/support-matrix/asr.html#supported-languages-by-model-type
 
     Args:
         language: Language enum value.
 
     Returns:
-        Optional[str]: NVIDIA Riva language code or None if not supported.
+        The NVIDIA Nemotron Speech language code. If ``language`` is not in
+        the verified mapping, falls back to the full language code string and
+        logs a warning (via ``resolve_language(..., use_base_code=False)``).
     """
     LANGUAGE_MAP = {
         # Arabic
@@ -88,435 +106,362 @@ def language_to_nvidia_riva_language(language: Language) -> Optional[str]:
     return resolve_language(language, LANGUAGE_MAP, use_base_code=False)
 
 
-class NvidiaSTTService(STTService):
-    """Real-time speech-to-text service using NVIDIA Riva streaming ASR.
+def _speaker_tagged_words(alternative) -> list[tuple[str, int | None]] | None:
+    """Return an alternative's ``(word, speaker_tag)`` pairs, or ``None`` without words."""
+    # Models such as canary-1b-asr return no words, so there is nothing to split.
+    words = getattr(alternative, "words", None)
+    if not words:
+        return None
+    # NVIDIA numbers speakers from 1; 0 is the protobuf default for a word the
+    # server did not tag.
+    return [(getattr(word, "word", ""), getattr(word, "speaker_tag", 0) or None) for word in words]
 
-    Provides real-time transcription capabilities using NVIDIA's Riva ASR models
-    through streaming recognition. Supports interim results and continuous audio
-    processing for low-latency applications.
+
+@dataclass
+class _NvidiaBaseSTTSettings(STTSettings):
+    """Shared settings for NVIDIA Nemotron Speech STT services.
+
+    Parameters:
+        profanity_filter: Whether to filter profanity from results.
+        automatic_punctuation: Whether to add automatic punctuation.
+        verbatim_transcripts: Whether to return verbatim transcripts.
+        boosted_lm_words: List of words to boost in language model.
+        boosted_lm_score: Score boost for specified words.
+        max_alternatives: Maximum number of recognition alternatives.
+        word_time_offsets: Whether to include word-level time offsets.
+        speaker_diarization: Whether to enable speaker diarization. Each
+            contiguous speaker run of a final result is emitted as its own frame
+            with NVIDIA's speaker tag (numbered from ``1``) as ``speaker.label``.
+            A result with an untagged word, no word information, or words that
+            can't be located in its transcript is emitted whole, with no label.
+        max_speakers: Maximum number of speakers for diarization.
+        diarization_max_speakers: Maximum number of speakers for diarization.
+
+            .. deprecated:: 1.16.0
+                Use ``max_speakers`` instead. Will be removed in 2.0.0.
+
+        speaker_format: Optional format string for diarized speaker runs. Use ``{speaker}`` for the
+            speaker tag, ``{text}`` for the transcript text, and ``{speaker_number}`` for the
+            speaker's order of first appearance in the session (``1``, ``2``, ...). If ``None``,
+            transcript text is not modified.
     """
 
-    class InputParams(BaseModel):
-        """Configuration parameters for NVIDIA Riva STT service.
+    profanity_filter: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    automatic_punctuation: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    verbatim_transcripts: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    boosted_lm_words: list[str] | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    boosted_lm_score: float | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_alternatives: int | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    word_time_offsets: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speaker_diarization: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    max_speakers: int | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    diarization_max_speakers: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    speaker_format: str | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
-        Parameters:
-            language: Target language for transcription. Defaults to EN_US.
-        """
 
-        language: Optional[Language] = Language.EN_US
+_STTSettingsT = TypeVar("_STTSettingsT", bound=STTSettings)
 
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        server: str = "grpc.nvcf.nvidia.com:443",
-        model_function_map: Mapping[str, str] = {
-            "function_id": "1598d209-5e27-4d3c-8079-4751568b1081",
-            "model_name": "parakeet-ctc-1.1b-asr",
-        },
-        sample_rate: Optional[int] = None,
-        params: Optional[InputParams] = None,
-        **kwargs,
-    ):
-        """Initialize the NVIDIA Riva STT service.
 
-        Args:
-            api_key: NVIDIA API key for authentication.
-            server: NVIDIA Riva server address. Defaults to NVIDIA Cloud Function endpoint.
-            model_function_map: Mapping containing 'function_id' and 'model_name' for the ASR model.
-            sample_rate: Audio sample rate in Hz. If None, uses pipeline default.
-            params: Additional configuration parameters for NVIDIA Riva.
-            **kwargs: Additional arguments passed to STTService.
-        """
-        super().__init__(sample_rate=sample_rate, **kwargs)
+def _migrate_diarization_max_speakers(settings: _STTSettingsT) -> _STTSettingsT:
+    """Move the deprecated ``diarization_max_speakers`` into ``max_speakers``.
 
-        params = params or NvidiaSTTService.InputParams()
+    An explicit ``max_speakers`` in the same settings takes precedence.
+    """
+    value = getattr(settings, "diarization_max_speakers", NOT_GIVEN)
+    if not is_given(value) or value is None:
+        return settings
+    warn_deprecated(
+        "`diarization_max_speakers` is deprecated since 1.16.0 and will be removed in 2.0.0. "
+        "Use `max_speakers` instead.",
+        stacklevel=3,
+    )
+    max_speakers = getattr(settings, "max_speakers", NOT_GIVEN)
+    return replace(
+        settings,
+        max_speakers=max_speakers if is_given(max_speakers) else value,
+        diarization_max_speakers=NOT_GIVEN,
+    )
 
-        self._api_key = api_key
-        self._profanity_filter = False
-        self._automatic_punctuation = True
-        self._no_verbatim_transcripts = False
-        self._language_code = params.language
-        self._boosted_lm_words = None
-        self._boosted_lm_score = 4.0
-        self._start_history = -1
-        self._start_threshold = -1.0
-        self._stop_history = -1
-        self._stop_threshold = -1.0
-        self._stop_history_eou = -1
-        self._stop_threshold_eou = -1.0
-        self._custom_configuration = ""
-        self._function_id = model_function_map.get("function_id")
 
-        self._settings = {
-            "language": str(params.language),
-            "profanity_filter": self._profanity_filter,
-            "automatic_punctuation": self._automatic_punctuation,
-            "verbatim_transcripts": not self._no_verbatim_transcripts,
-            "boosted_lm_words": self._boosted_lm_words,
-            "boosted_lm_score": self._boosted_lm_score,
-        }
+@dataclass
+class NvidiaSTTSettings(_NvidiaBaseSTTSettings):
+    """Settings for NvidiaSTTService.
 
-        self.set_model_name(model_function_map.get("model_name"))
+    Parameters:
+        interim_results: Whether to return interim (partial) results. They
+            carry no word information, so they are never split by speaker.
+    """
 
-        metadata = [
-            ["function-id", self._function_id],
-            ["authorization", f"Bearer {api_key}"],
-        ]
-        auth = riva.client.Auth(None, True, server, metadata)
+    interim_results: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
-        self._asr_service = riva.client.ASRService(auth)
+    #: Fields that are purely local (formatting templates) — no reconnect needed.
+    LOCAL_FIELDS: ClassVar[frozenset[str]] = frozenset({"speaker_format"})
 
-        self._queue = None
-        self._config = None
-        self._thread_task = None
-        self._response_task = None
 
-    def can_generate_metrics(self) -> bool:
-        """Check if this service can generate processing metrics.
+@dataclass
+class NvidiaSegmentedSTTSettings(_NvidiaBaseSTTSettings):
+    """Settings for NvidiaSegmentedSTTService."""
 
-        Returns:
-            False - this service does not support metrics generation.
-        """
-        return False
+    pass
 
-    async def set_model(self, model: str):
-        """Set the ASR model for transcription.
+
+class AudioChunkIterator:
+    """Per-stream iterator that feeds audio chunks to NVIDIA's gRPC stream.
+
+    The NVIDIA client consumes audio synchronously from a worker thread, while
+    Pipecat produces audio asynchronously on the event loop. This iterator
+    bridges those two worlds and owns the logic for unblocking and closing a
+    single stream cleanly.
+    """
+
+    _QUEUE_SENTINEL = object()
+
+    def __init__(self, event_loop: asyncio.AbstractEventLoop):
+        """Initialize the iterator for a single streaming session.
 
         Args:
-            model: Model name to set.
-
-        Note:
-            Model cannot be changed after initialization. Use model_function_map
-            parameter in constructor instead.
+            event_loop: Event loop used to await queue operations from the
+                worker thread.
         """
-        logger.warning(f"Cannot set model after initialization. Set model and function id like so:")
-        example = {"function_id": "<UUID>", "model_name": "<model_name>"}
-        logger.warning(
-            f"{self.__class__.__name__}(api_key=<api_key>, model_function_map={example})"
-        )
+        self._event_loop = event_loop
+        self._queue: asyncio.Queue[bytes | object] = asyncio.Queue()
+        self._closed = False
 
-    async def start(self, frame: StartFrame):
-        """Start the NVIDIA Riva STT service and initialize streaming configuration.
+    @property
+    def closed(self) -> bool:
+        """Whether the iterator has been closed intentionally."""
+        return self._closed
+
+    async def put(self, audio: bytes) -> None:
+        """Enqueue audio for the active stream.
 
         Args:
-            frame: StartFrame indicating pipeline start.
+            audio: Raw PCM audio bytes to send to the server.
         """
-        await super().start(frame)
-
-        if self._config:
+        if self._closed:
             return
-
-        config = riva.client.StreamingRecognitionConfig(
-            config=riva.client.RecognitionConfig(
-                encoding=riva.client.AudioEncoding.LINEAR_PCM,
-                language_code=self._language_code,
-                model="",
-                max_alternatives=1,
-                profanity_filter=self._profanity_filter,
-                enable_automatic_punctuation=self._automatic_punctuation,
-                verbatim_transcripts=not self._no_verbatim_transcripts,
-                sample_rate_hertz=self.sample_rate,
-                audio_channel_count=1,
-            ),
-            interim_results=True,
-        )
-
-        riva.client.add_word_boosting_to_config(
-            config, self._boosted_lm_words, self._boosted_lm_score
-        )
-
-        riva.client.add_endpoint_parameters_to_config(
-            config,
-            self._start_history,
-            self._start_threshold,
-            self._stop_history,
-            self._stop_history_eou,
-            self._stop_threshold,
-            self._stop_threshold_eou,
-        )
-        riva.client.add_custom_configuration_to_config(config, self._custom_configuration)
-
-        self._config = config
-        self._queue = asyncio.Queue()
-
-        if not self._thread_task:
-            self._thread_task = self.create_task(self._thread_task_handler())
-
-        if not self._response_task:
-            self._response_queue = asyncio.Queue()
-            self._response_task = self.create_task(self._response_task_handler())
-
-    async def stop(self, frame: EndFrame):
-        """Stop the NVIDIA Riva STT service and clean up resources.
-
-        Args:
-            frame: EndFrame indicating pipeline stop.
-        """
-        await super().stop(frame)
-        await self._stop_tasks()
-
-    async def cancel(self, frame: CancelFrame):
-        """Cancel the NVIDIA Riva STT service operation.
-
-        Args:
-            frame: CancelFrame indicating operation cancellation.
-        """
-        await super().cancel(frame)
-        await self._stop_tasks()
-
-    async def _stop_tasks(self):
-        if self._thread_task:
-            await self.cancel_task(self._thread_task)
-            self._thread_task = None
-
-        if self._response_task:
-            await self.cancel_task(self._response_task)
-            self._response_task = None
-
-    def _response_handler(self):
-        responses = self._asr_service.streaming_response_generator(
-            audio_chunks=self,
-            streaming_config=self._config,
-        )
-        for response in responses:
-            if not response.results:
-                continue
-            asyncio.run_coroutine_threadsafe(
-                self._response_queue.put(response), self.get_event_loop()
-            )
-
-    async def _thread_task_handler(self):
-        try:
-            self._thread_running = True
-            await asyncio.to_thread(self._response_handler)
-        except asyncio.CancelledError:
-            self._thread_running = False
-            raise
-
-    @traced_stt
-    async def _handle_transcription(
-        self, transcript: str, is_final: bool, language: Optional[Language] = None
-    ):
-        """Handle a transcription result with tracing."""
-        pass
-
-    async def _handle_response(self, response):
-        for result in response.results:
-            if result and not result.alternatives:
-                continue
-
-            transcript = result.alternatives[0].transcript
-            if transcript and len(transcript) > 0:
-                await self.stop_ttfb_metrics()
-                if result.is_final:
-                    await self.stop_processing_metrics()
-                    await self.push_frame(
-                        TranscriptionFrame(
-                            transcript,
-                            self._user_id,
-                            time_now_iso8601(),
-                            self._language_code,
-                            result=result,
-                        )
-                    )
-                    await self._handle_transcription(
-                        transcript=transcript,
-                        is_final=result.is_final,
-                        language=self._language_code,
-                    )
-                else:
-                    await self.push_frame(
-                        InterimTranscriptionFrame(
-                            transcript,
-                            self._user_id,
-                            time_now_iso8601(),
-                            self._language_code,
-                            result=result,
-                        )
-                    )
-
-    async def _response_task_handler(self):
-        while True:
-            response = await self._response_queue.get()
-            await self._handle_response(response)
-            self._response_queue.task_done()
-
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        """Process audio data for speech-to-text transcription.
-
-        Args:
-            audio: Raw audio bytes to transcribe.
-
-        Yields:
-            None - transcription results are pushed to the pipeline via frames.
-        """
-        await self.start_ttfb_metrics()
-        await self.start_processing_metrics()
         await self._queue.put(audio)
-        yield None
+
+    async def close(self) -> None:
+        """Close the iterator and unblock any pending read."""
+        if self._closed:
+            return
+        self._closed = True
+        await self._queue.put(self._QUEUE_SENTINEL)
+
+    def __iter__(self):
+        """Return the iterator instance."""
+        return self
 
     def __next__(self) -> bytes:
-        """Get the next audio chunk for NVIDIA Riva processing.
+        """Get the next audio chunk for the active stream.
 
         Returns:
             Audio bytes from the queue.
 
         Raises:
-            StopIteration: When the thread is no longer running.
+            StopIteration: When the iterator has been closed.
         """
-        if not self._thread_running:
+        if self._closed:
             raise StopIteration
 
         try:
-            future = asyncio.run_coroutine_threadsafe(self._queue.get(), self.get_event_loop())
-            return future.result()
+            future = asyncio.run_coroutine_threadsafe(self._queue.get(), self._event_loop)
+            audio = future.result()
         except FuturesCancelledError:
             raise StopIteration
 
-    def __iter__(self):
-        """Return iterator for audio chunk processing.
+        if audio is self._QUEUE_SENTINEL:
+            self._closed = True
+            raise StopIteration
 
-        Returns:
-            Self as iterator.
-        """
-        return self
+        # Only put() (bytes) and close() (the sentinel, excluded above) write
+        # to the queue.
+        return cast(bytes, audio)
 
 
-class NvidiaSegmentedSTTService(SegmentedSTTService):
-    """Speech-to-text service using NVIDIA Riva's offline/batch models.
+class NvidiaSTTService(STTService):
+    """Real-time speech-to-text service using NVIDIA Nemotron Speech streaming ASR.
 
-    By default, his service uses NVIDIA's Riva Canary ASR API to perform speech-to-text
-    transcription on audio segments. It inherits from SegmentedSTTService to handle
-    audio buffering and speech detection.
+    Provides real-time transcription capabilities using NVIDIA's Nemotron Speech ASR models
+    through streaming recognition. Supports interim results and continuous audio
+    processing for low-latency applications. When speaker diarization is enabled, each
+    contiguous speaker run of a final result is emitted as a separate frame with its speaker
+    tag as ``speaker.label``.
     """
 
+    Settings = NvidiaSTTSettings
+    _settings: Settings
+
+    @deprecated(
+        "`NvidiaSTTService.InputParams` is deprecated since 0.0.105 and will be removed in 2.0.0. "
+        "Use `NvidiaSTTService.Settings` instead."
+    )
     class InputParams(BaseModel):
-        """Configuration parameters for NVIDIA Riva segmented STT service.
+        """Configuration parameters for NVIDIA Nemotron Speech STT service.
+
+        .. deprecated:: 0.0.105
+            Use ``settings=NvidiaSTTService.Settings(...)`` instead.
+            Will be removed in 2.0.0.
 
         Parameters:
             language: Target language for transcription. Defaults to EN_US.
-            profanity_filter: Whether to filter profanity from results.
-            automatic_punctuation: Whether to add automatic punctuation.
-            verbatim_transcripts: Whether to return verbatim transcripts.
-            boosted_lm_words: List of words to boost in language model.
-            boosted_lm_score: Score boost for specified words.
         """
 
-        language: Optional[Language] = Language.EN_US
-        profanity_filter: bool = False
-        automatic_punctuation: bool = True
-        verbatim_transcripts: bool = False
-        boosted_lm_words: Optional[List[str]] = None
-        boosted_lm_score: float = 4.0
+        language: Language | None = Language.EN_US
 
     def __init__(
         self,
         *,
-        api_key: str,
+        api_key: str | None = None,
         server: str = "grpc.nvcf.nvidia.com:443",
         model_function_map: Mapping[str, str] = {
-            "function_id": "ee8dc628-76de-4acc-8595-1836e7e857bd",
-            "model_name": "canary-1b-asr",
+            # The function id identifies NVIDIA's hosted deployment of the model
+            # and changes when NVIDIA redeploys it. The current id is on
+            # https://build.nvidia.com/nvidia/nemotron-asr-streaming/api
+            "function_id": "bb0837de-8c7b-481f-9ec8-ef5663e9c1fa",
+            "model_name": "nemotron-asr-streaming",
         },
-        sample_rate: Optional[int] = None,
-        params: Optional[InputParams] = None,
+        sample_rate: int | None = None,
+        params: InputParams | None = None,
+        use_ssl: bool = True,
+        audio_channel_count: int = 1,
+        start_history: int = -1,
+        start_threshold: float = -1.0,
+        stop_history: int = 320,
+        stop_threshold: float = -1.0,
+        stop_history_eou: int = -1,
+        stop_threshold_eou: float = -1.0,
+        custom_configuration: str = "",
+        settings: Settings | None = None,
+        ttfs_p99_latency: float | None = NVIDIA_TTFS_P99,
         **kwargs,
     ):
-        """Initialize the NVIDIA Riva segmented STT service.
+        """Initialize the NVIDIA Nemotron Speech STT service.
 
         Args:
-            api_key: NVIDIA API key for authentication
-            server: NVIDIA Riva server address (defaults to NVIDIA Cloud Function endpoint)
-            model_function_map: Mapping of model name and its corresponding NVIDIA Cloud Function ID
-            sample_rate: Audio sample rate in Hz. If not provided, uses the pipeline's rate
-            params: Additional configuration parameters for NVIDIA Riva
-            **kwargs: Additional arguments passed to SegmentedSTTService
+            api_key: NVIDIA API key for authentication. Required when using the
+                cloud endpoint. Not needed for local deployments.
+            server: NVIDIA Nemotron Speech server address. Defaults to NVIDIA Cloud Function endpoint.
+                For local deployments, pass the local address (e.g. ``localhost:50051``).
+            model_function_map: Mapping containing 'function_id' and 'model_name' for the ASR model.
+            sample_rate: Audio sample rate in Hz. If None, uses pipeline default.
+            params: Additional configuration parameters for NVIDIA Nemotron Speech.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=NvidiaSTTService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
+
+            use_ssl: Whether to use SSL for the gRPC connection. Defaults to True
+                for the NVIDIA cloud endpoint. Set to False for local deployments.
+            audio_channel_count: Number of audio channels.
+            start_history: VAD start history in frames. Use -1 for Nemotron Speech default.
+            start_threshold: VAD start threshold. Use -1.0 for Nemotron Speech default.
+            stop_history: VAD stop history in frames. Use -1 for Nemotron Speech default.
+            stop_threshold: VAD stop threshold. Use -1.0 for Nemotron Speech default.
+            stop_history_eou: End-of-utterance stop history in frames. Use -1 for Nemotron Speech default.
+            stop_threshold_eou: End-of-utterance stop threshold. Use -1.0 for Nemotron Speech default.
+            custom_configuration: Custom Nemotron Speech configuration string
+                (e.g. ``"enable_vad_endpointing:true,neural_vad.onset:0.65"``).
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+                Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
+            **kwargs: Additional arguments passed to STTService.
         """
-        super().__init__(sample_rate=sample_rate, **kwargs)
-
-        params = params or NvidiaSegmentedSTTService.InputParams()
-
-        # Set model name
-        self.set_model_name(model_function_map.get("model_name"))
-
-        # Initialize NVIDIA Riva settings
-        self._api_key = api_key
-        self._server = server
-        self._function_id = model_function_map.get("function_id")
-        self._model_name = model_function_map.get("model_name")
-
-        # Store the language as a Language enum and as a string
-        self._language_enum = params.language or Language.EN_US
-        self._language = self.language_to_service_language(self._language_enum) or "en-US"
-
-        # Configure transcription parameters
-        self._profanity_filter = params.profanity_filter
-        self._automatic_punctuation = params.automatic_punctuation
-        self._verbatim_transcripts = params.verbatim_transcripts
-        self._boosted_lm_words = params.boosted_lm_words
-        self._boosted_lm_score = params.boosted_lm_score
-
-        # Voice activity detection thresholds (use NVIDIA Riva defaults)
-        self._start_history = -1
-        self._start_threshold = -1.0
-        self._stop_history = -1
-        self._stop_threshold = -1.0
-        self._stop_history_eou = -1
-        self._stop_threshold_eou = -1.0
-        self._custom_configuration = ""
-
-        # Create NVIDIA Riva client
-        self._config = None
-        self._asr_service = None
-        self._settings = {"language": self._language_enum}
-
-    def language_to_service_language(self, language: Language) -> Optional[str]:
-        """Convert pipecat Language enum to NVIDIA Riva's language code.
-
-        Args:
-            language: Language enum value.
-
-        Returns:
-            NVIDIA Riva language code or None if not supported.
-        """
-        return language_to_nvidia_riva_language(language)
-
-    def _initialize_client(self):
-        """Initialize the NVIDIA Riva ASR client with authentication metadata."""
-        if self._asr_service is not None:
-            return
-
-        # Set up authentication metadata for NVIDIA Cloud Functions
-        metadata = [
-            ["function-id", self._function_id],
-            ["authorization", f"Bearer {self._api_key}"],
-        ]
-
-        # Create authenticated client
-        auth = riva.client.Auth(None, True, self._server, metadata)
-        self._asr_service = riva.client.ASRService(auth)
-
-        logger.info(f"Initialized NvidiaSegmentedSTTService with model: {self.model_name}")
-
-    def _create_recognition_config(self):
-        """Create the NVIDIA Riva ASR recognition configuration."""
-        # Create base configuration
-        config = riva.client.RecognitionConfig(
-            language_code=self._language,  # Now using the string, not a tuple
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(
+            model=model_function_map.get("model_name"),
+            language=Language.EN_US,
+            profanity_filter=False,
+            automatic_punctuation=True,
+            verbatim_transcripts=True,
+            boosted_lm_words=None,
+            boosted_lm_score=4.0,
             max_alternatives=1,
-            profanity_filter=self._profanity_filter,
-            enable_automatic_punctuation=self._automatic_punctuation,
-            verbatim_transcripts=self._verbatim_transcripts,
+            interim_results=True,
+            word_time_offsets=False,
+            speaker_diarization=False,
+            max_speakers=0,
+            diarization_max_speakers=None,
+            speaker_format=None,
         )
 
-        # Add word boosting if specified
-        if self._boosted_lm_words:
+        # 2. (no deprecated direct args for this service)
+
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            self._warn_init_param_moved_to_settings("params")
+            if not settings:
+                default_settings.language = params.language
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(_migrate_diarization_max_speakers(settings))
+
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            keepalive_timeout=30.0,
+            keepalive_interval=5.0,
+            settings=default_settings,
+            **kwargs,
+        )
+
+        self._server = server
+        self._api_key = api_key
+        self._use_ssl = use_ssl
+        self._audio_channel_count = audio_channel_count
+        self._start_history = start_history
+        self._start_threshold = start_threshold
+        self._stop_history = stop_history
+        self._stop_threshold = stop_threshold
+        self._stop_history_eou = stop_history_eou
+        self._stop_threshold_eou = stop_threshold_eou
+        self._custom_configuration = custom_configuration
+        self._function_id = model_function_map.get("function_id")
+
+        self._asr_service = None
+        self._audio_iterator: AudioChunkIterator | None = None
+        self._config = None
+        self._thread_task = None
+
+    def _initialize_client(self):
+        """Initialize the NVIDIA Nemotron Speech ASR client with authentication metadata."""
+        metadata = []
+        if self._function_id:
+            metadata.append(["function-id", self._function_id])
+        if self._api_key:
+            metadata.append(["authorization", f"Bearer {self._api_key}"])
+        auth = riva.client.Auth(None, self._use_ssl, self._server, metadata)
+
+        self._asr_service = riva.client.ASRService(auth)
+
+    def _create_recognition_config(self):
+        """Create the NVIDIA Nemotron Speech ASR recognition configuration."""
+        s = self._settings
+        config = riva.client.StreamingRecognitionConfig(
+            config=riva.client.RecognitionConfig(
+                encoding=riva.client.AudioEncoding.LINEAR_PCM,
+                language_code=s.language,
+                model="",
+                max_alternatives=s.max_alternatives,
+                profanity_filter=s.profanity_filter,
+                enable_automatic_punctuation=s.automatic_punctuation,
+                verbatim_transcripts=s.verbatim_transcripts,
+                sample_rate_hertz=self.sample_rate,
+                audio_channel_count=self._audio_channel_count,
+                enable_word_time_offsets=s.word_time_offsets,
+            ),
+            interim_results=s.interim_results,
+        )
+
+        boosted_lm_words = assert_given(s.boosted_lm_words)
+        if boosted_lm_words:
             riva.client.add_word_boosting_to_config(
-                config, self._boosted_lm_words, self._boosted_lm_score
+                config, boosted_lm_words, assert_given(s.boosted_lm_score)
             )
 
-        # Add voice activity detection parameters
         riva.client.add_endpoint_parameters_to_config(
             config,
             self._start_history,
@@ -527,9 +472,14 @@ class NvidiaSegmentedSTTService(SegmentedSTTService):
             self._stop_threshold_eou,
         )
 
-        # Add any custom configuration
         if self._custom_configuration:
             riva.client.add_custom_configuration_to_config(config, self._custom_configuration)
+
+        speaker_diarization = assert_given(s.speaker_diarization)
+        if speaker_diarization:
+            riva.client.add_speaker_diarization_to_config(
+                config, speaker_diarization, assert_given(s.max_speakers)
+            )
 
         return config
 
@@ -541,21 +491,494 @@ class NvidiaSegmentedSTTService(SegmentedSTTService):
         """
         return True
 
+    async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
+        """Apply a settings delta, then reconnect so the stream picks it up.
+
+        Args:
+            delta: A :class:`STTSettings` (or ``NvidiaSTTService.Settings``) delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(_migrate_diarization_max_speakers(delta))
+
+        if not changed:
+            return changed
+
+        server_settings_changed = changed.keys() - self.Settings.LOCAL_FIELDS
+        if self._config is not None and server_settings_changed:
+            self._config = self._create_recognition_config()
+
+        # streaming_response_generator() receives streaming_config once, when the
+        # gRPC stream is opened, so rebuilding the config alone leaves the running
+        # stream transcribing with the previous settings. _request_reconnect()
+        # defers until the user stops speaking, so this cannot cut into a turn.
+        if server_settings_changed:
+            await self._request_reconnect()
+
+        return changed
+
+    @deprecated(
+        "`NvidiaSTTService.set_model` is deprecated since 0.0.104 and will be removed in 2.0.0. "
+        "No replacement."
+    )
     async def set_model(self, model: str):
         """Set the ASR model for transcription.
 
+        .. deprecated:: 0.0.104
+            No replacement. Model cannot be changed after initialization for NVIDIA Nemotron
+            Speech streaming STT; set model and function id in the constructor instead.
+            Will be removed in 2.0.0.
+
+            Example::
+
+                NvidiaSTTService(
+                    api_key=...,
+                    model_function_map={"function_id": "<UUID>", "model_name": "<model_name>"},
+                )
+
         Args:
             model: Model name to set.
-
-        Note:
-            Model cannot be changed after initialization. Use model_function_map
-            parameter in constructor instead.
         """
-        logger.warning(f"Cannot set model after initialization. Set model and function id like so:")
-        example = {"function_id": "<UUID>", "model_name": "<model_name>"}
-        logger.warning(
-            f"{self.__class__.__name__}(api_key=<api_key>, model_function_map={example})"
+
+    async def setup(self, setup: FrameProcessorSetup):
+        """Set up the service.
+
+        Args:
+            setup: Configuration object containing setup parameters.
+        """
+        await super().setup(setup)
+        self._initialize_client()
+        self._config = self._create_recognition_config()
+        self._audio_iterator = AudioChunkIterator(self.get_event_loop())
+        self._create_keepalive_task()
+        logger.debug(f"Initialized NvidiaSTTService with model: {self._settings.model}")
+
+    async def start(self, frame: StartFrame):
+        """Start the NVIDIA Nemotron Speech STT service and initialize streaming configuration.
+
+        Args:
+            frame: StartFrame indicating pipeline start.
+        """
+        await super().start(frame)
+
+        if not self._thread_task:
+            self._thread_task = self.create_task(self._thread_task_handler())
+
+    async def stop(self, frame: EndFrame):
+        """Stop the NVIDIA Nemotron Speech STT service and clean up resources.
+
+        Args:
+            frame: EndFrame indicating pipeline stop.
+        """
+        await super().stop(frame)
+        await self._stop_tasks()
+
+    async def cancel(self, frame: CancelFrame):
+        """Cancel the NVIDIA Nemotron Speech STT service operation.
+
+        Args:
+            frame: CancelFrame indicating operation cancellation.
+        """
+        await super().cancel(frame)
+        await self._stop_tasks()
+
+    async def cleanup(self):
+        """Release the streaming ASR resources at teardown."""
+        await super().cleanup()
+        await self._stop_tasks()
+
+    async def _stop_tasks(self, close_iterator: bool = True):
+        """Stop the active stream thread and optionally close the shared iterator.
+
+        ``close_iterator=False`` is used during reconnect so we can tear down the
+        current gRPC stream but keep buffering audio on the same iterator until
+        the replacement stream starts consuming it.
+        """
+        if close_iterator:
+            await self._cancel_keepalive_task()
+
+        iterator = self._audio_iterator
+        if close_iterator:
+            self._audio_iterator = None
+        if close_iterator and iterator is not None:
+            await iterator.close()
+
+        if self._thread_task:
+            await self.cancel_task(self._thread_task)
+            self._thread_task = None
+
+    async def _do_reconnect(self):
+        iterator = self._audio_iterator
+        if iterator is None or iterator.closed:
+            return
+
+        await self._stop_tasks(close_iterator=False)
+        self._initialize_client()
+        self._config = self._create_recognition_config()
+        self._thread_task = self.create_task(self._thread_task_handler())
+
+    async def _handle_stream_drop(self, iterator: AudioChunkIterator, reason: str):
+        if iterator.closed or iterator is not self._audio_iterator:
+            return
+
+        logger.warning(f"{self} stream dropped: {reason}")
+        await self._request_reconnect()
+
+    def _response_handler(self, iterator: AudioChunkIterator, config):
+        drop_reason = None
+        try:
+            asr_service = self._asr_service
+            assert asr_service is not None, "ASR service not initialized"
+            speaker_diarization = bool(
+                config and config.config.diarization_config.enable_speaker_diarization
+            )
+            responses = asr_service.streaming_response_generator(
+                audio_chunks=iterator,
+                streaming_config=config,
+            )
+            for response in responses:
+                if not response.results:
+                    continue
+                asyncio.run_coroutine_threadsafe(
+                    self._handle_response(
+                        response,
+                        speaker_diarization=speaker_diarization,
+                    ),
+                    self.get_event_loop(),
+                )
+            drop_reason = "server closed the gRPC stream"
+        except grpc.RpcError as e:
+            status = e.code().name if hasattr(e, "code") else "UNKNOWN"
+            details = e.details() if hasattr(e, "details") else str(e)
+            drop_reason = f"gRPC {status}: {details}"
+        except Exception as e:
+            drop_reason = str(e)
+            logger.error(f"{self} unexpected streaming error: {e}")
+
+        if drop_reason:
+            asyncio.run_coroutine_threadsafe(
+                self._handle_stream_drop(iterator, drop_reason),
+                self.get_event_loop(),
+            )
+
+    async def _thread_task_handler(self):
+        iterator = self._audio_iterator
+        if iterator is None:
+            return
+
+        config = self._config
+        try:
+            await asyncio.to_thread(self._response_handler, iterator, config)
+        except asyncio.CancelledError:
+            raise
+
+    def _is_keepalive_ready(self) -> bool:
+        """Check if there is an active NVIDIA audio stream for keepalive."""
+        iterator = self._audio_iterator
+        return iterator is not None and not iterator.closed
+
+    async def _send_keepalive(self, silence: bytes):
+        """Send silent audio through the active NVIDIA stream iterator."""
+        iterator = self._audio_iterator
+        if iterator is not None and not iterator.closed:
+            await iterator.put(silence)
+
+    @traced_stt
+    async def _handle_transcription(
+        self, transcript: str, is_final: bool, language: Language | None = None
+    ):
+        """Handle a transcription result with tracing."""
+        pass
+
+    async def _push_result_frames(
+        self,
+        result,
+        language: Language | None,
+        *,
+        speaker_diarization: bool,
+    ) -> None:
+        """Push one frame per speaker run, or one frame for the full result."""
+        alternative = result.alternatives[0]
+        if not alternative.transcript:
+            return
+
+        # NVIDIA sends word information, and so speaker tags, only on final results.
+        if not result.is_final:
+            await self.push_frame(
+                InterimTranscriptionFrame(
+                    alternative.transcript,
+                    self._user_id,
+                    time_now_iso8601(),
+                    language,
+                    result=result,
+                )
+            )
+            return
+
+        words = _speaker_tagged_words(alternative) if speaker_diarization else None
+        runs = self._diarized_runs(alternative.transcript, words)
+        await self._push_transcription_runs(runs, language=language, result=result, finalized=True)
+
+    async def _handle_response(self, response, *, speaker_diarization: bool = False):
+        for result in response.results:
+            if result and not result.alternatives:
+                continue
+
+            transcript = result.alternatives[0].transcript
+            if transcript and len(transcript) > 0:
+                # Technically `_settings.language` could be a raw string, but
+                # Language is a StrEnum so downstream handles either.
+                language = cast("Language | None", assert_given(self._settings.language))
+                if result.is_final:
+                    logger.debug(f"Transcription: [{transcript}]")
+                    # Report usage before the transcription frame so tracing
+                    # can attach it to the STT span the frame closes.
+                    await self.emit_stt_usage_metrics()
+                    await self._push_result_frames(
+                        result,
+                        language,
+                        speaker_diarization=speaker_diarization,
+                    )
+                    await self._handle_transcription(
+                        transcript=transcript,
+                        is_final=result.is_final,
+                        language=language,
+                    )
+                else:
+                    await self._push_result_frames(
+                        result,
+                        language,
+                        speaker_diarization=speaker_diarization,
+                    )
+                    logger.trace(f"Interim Transcription: [{transcript}]")
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
+        """Process audio data for speech-to-text transcription.
+
+        Args:
+            audio: Raw audio bytes to transcribe.
+
+        Yields:
+            None - transcription results are pushed to the pipeline via frames.
+        """
+        iterator = self._audio_iterator
+        if iterator is not None and not iterator.closed:
+            await iterator.put(audio)
+        yield None
+
+
+class NvidiaSegmentedSTTService(SegmentedSTTService):
+    """Speech-to-text service using NVIDIA Nemotron Speech's offline/batch models.
+
+    By default, this service uses NVIDIA's Nemotron Speech Canary ASR API to perform speech-to-text
+    transcription on audio segments. It inherits from SegmentedSTTService to handle
+    audio buffering and speech detection.
+
+    Speaker diarization needs a model that returns word-level results. The
+    default ``canary-1b-asr`` returns none, so with it every segment is emitted
+    whole, with no ``speaker``. ``parakeet-ctc-1.1b-asr`` does: pass its
+    ``model_name`` and ``function_id`` (from
+    https://build.nvidia.com/nvidia/parakeet-ctc-1_1b-asr) in
+    ``model_function_map``.
+    """
+
+    Settings = NvidiaSegmentedSTTSettings
+    _settings: Settings
+
+    @deprecated(
+        "`NvidiaSegmentedSTTService.InputParams` is deprecated since 0.0.105 and will be removed "
+        "in 2.0.0. Use `NvidiaSegmentedSTTService.Settings` instead."
+    )
+    class InputParams(BaseModel):
+        """Configuration parameters for NVIDIA Nemotron Speech segmented STT service.
+
+        .. deprecated:: 0.0.105
+            Use ``settings=NvidiaSegmentedSTTService.Settings(...)`` instead.
+            Will be removed in 2.0.0.
+
+        Parameters:
+            language: Target language for transcription. Defaults to EN_US.
+            profanity_filter: Whether to filter profanity from results.
+            automatic_punctuation: Whether to add automatic punctuation.
+            verbatim_transcripts: Whether to return verbatim transcripts.
+            boosted_lm_words: List of words to boost in language model.
+            boosted_lm_score: Score boost for specified words.
+        """
+
+        language: Language | None = Language.EN_US
+        profanity_filter: bool = False
+        automatic_punctuation: bool = True
+        verbatim_transcripts: bool = False
+        boosted_lm_words: list[str] | None = None
+        boosted_lm_score: float = 4.0
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        server: str = "grpc.nvcf.nvidia.com:443",
+        model_function_map: Mapping[str, str] = {
+            # The function id identifies NVIDIA's hosted deployment of the model
+            # and changes when NVIDIA redeploys it. The current id is on
+            # https://build.nvidia.com/nvidia/canary-1b-asr/api
+            "function_id": "b0e8b4a5-217c-40b7-9b96-17d84e666317",
+            "model_name": "canary-1b-asr",
+        },
+        sample_rate: int | None = None,
+        params: InputParams | None = None,
+        use_ssl: bool = True,
+        custom_configuration: str = "",
+        settings: Settings | None = None,
+        ttfs_p99_latency: float | None = NVIDIA_TTFS_P99,
+        **kwargs,
+    ):
+        """Initialize the NVIDIA Nemotron Speech segmented STT service.
+
+        Args:
+            api_key: NVIDIA API key for authentication. Required when using the
+                cloud endpoint. Not needed for local deployments.
+            server: NVIDIA Nemotron Speech server address. Defaults to NVIDIA Cloud Function endpoint.
+                For local deployments, pass the local address (e.g. ``localhost:50051``).
+            model_function_map: Mapping of model name and its corresponding NVIDIA Cloud Function ID.
+            sample_rate: Audio sample rate in Hz. If not provided, uses the pipeline's rate.
+            params: Additional configuration parameters for NVIDIA Nemotron Speech.
+
+                .. deprecated:: 0.0.105
+                    Use ``settings=NvidiaSegmentedSTTService.Settings(...)`` instead.
+                    Will be removed in 2.0.0.
+
+            use_ssl: Whether to use SSL for the gRPC connection. Defaults to True
+                for the NVIDIA cloud endpoint. Set to False for local deployments.
+            custom_configuration: Custom Nemotron Speech configuration string
+                (e.g. ``"enable_vad_endpointing:true,neural_vad.onset:0.65"``).
+            settings: Runtime-updatable settings. When provided alongside deprecated
+                parameters, ``settings`` values take precedence.
+            ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
+                Override for your deployment. See https://github.com/pipecat-ai/stt-benchmark
+            **kwargs: Additional arguments passed to SegmentedSTTService.
+        """
+        # 1. Initialize default_settings with hardcoded defaults
+        default_settings = self.Settings(
+            model=model_function_map.get("model_name"),
+            language=Language.EN_US,
+            profanity_filter=False,
+            automatic_punctuation=True,
+            verbatim_transcripts=False,
+            boosted_lm_words=None,
+            boosted_lm_score=4.0,
+            max_alternatives=1,
+            word_time_offsets=False,
+            speaker_diarization=False,
+            max_speakers=0,
+            diarization_max_speakers=None,
+            speaker_format=None,
         )
+
+        # 2. (no deprecated direct args for this service)
+
+        # 3. Apply params overrides — only if settings not provided
+        if params is not None:
+            self._warn_init_param_moved_to_settings("params")
+            if not settings:
+                default_settings.language = params.language or Language.EN_US
+                default_settings.profanity_filter = params.profanity_filter
+                default_settings.automatic_punctuation = params.automatic_punctuation
+                default_settings.verbatim_transcripts = params.verbatim_transcripts
+                default_settings.boosted_lm_words = params.boosted_lm_words
+                default_settings.boosted_lm_score = params.boosted_lm_score
+
+        # 4. Apply settings delta (canonical API, always wins)
+        if settings is not None:
+            default_settings.apply_update(_migrate_diarization_max_speakers(settings))
+
+        super().__init__(
+            sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
+            settings=default_settings,
+            **kwargs,
+        )
+
+        # Initialize NVIDIA Nemotron Speech settings
+        self._api_key = api_key
+        self._server = server
+        self._use_ssl = use_ssl
+        self._function_id = model_function_map.get("function_id")
+        self._custom_configuration = custom_configuration
+
+        self._config = None
+        self._asr_service = None
+
+    def language_to_service_language(self, language: Language) -> str | None:
+        """Convert pipecat Language enum to NVIDIA Nemotron Speech's language code.
+
+        Args:
+            language: Language enum value.
+
+        Returns:
+            NVIDIA Nemotron Speech language code or None if not supported.
+        """
+        return language_to_nvidia_nemotron_speech_language(language)
+
+    def _initialize_client(self):
+        """Initialize the NVIDIA Nemotron Speech ASR client with authentication metadata."""
+        if self._asr_service is not None:
+            return
+
+        # Set up authentication metadata for NVIDIA Cloud Functions
+        metadata = []
+        if self._function_id:
+            metadata.append(["function-id", self._function_id])
+        if self._api_key:
+            metadata.append(["authorization", f"Bearer {self._api_key}"])
+
+        # Create authenticated client
+        auth = riva.client.Auth(None, self._use_ssl, self._server, metadata)
+        self._asr_service = riva.client.ASRService(auth)
+
+    def _get_language_code(self) -> str:
+        """Get the current NVIDIA Nemotron Speech language code string."""
+        return assert_given(self._settings.language) or "en-US"
+
+    def _create_recognition_config(self):
+        """Create the NVIDIA Nemotron Speech ASR recognition configuration."""
+        # Create base configuration
+        s = self._settings
+        config = riva.client.RecognitionConfig(
+            language_code=self._get_language_code(),
+            max_alternatives=s.max_alternatives,
+            profanity_filter=s.profanity_filter,
+            enable_automatic_punctuation=s.automatic_punctuation,
+            verbatim_transcripts=s.verbatim_transcripts,
+            enable_word_time_offsets=s.word_time_offsets,
+        )
+
+        # Add word boosting if specified
+        boosted_lm_words = assert_given(s.boosted_lm_words)
+        if boosted_lm_words:
+            riva.client.add_word_boosting_to_config(
+                config, boosted_lm_words, assert_given(s.boosted_lm_score)
+            )
+
+        # Add any custom configuration
+        if self._custom_configuration:
+            riva.client.add_custom_configuration_to_config(config, self._custom_configuration)
+
+        speaker_diarization = assert_given(s.speaker_diarization)
+        if speaker_diarization:
+            riva.client.add_speaker_diarization_to_config(
+                config, speaker_diarization, assert_given(s.max_speakers)
+            )
+
+        return config
+
+    def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics.
+
+        Returns:
+            True - this service supports metrics generation.
+        """
+        return True
 
     async def start(self, frame: StartFrame):
         """Initialize the service when the pipeline starts.
@@ -566,30 +989,32 @@ class NvidiaSegmentedSTTService(SegmentedSTTService):
         await super().start(frame)
         self._initialize_client()
         self._config = self._create_recognition_config()
+        logger.debug(f"Initialized NvidiaSegmentedSTTService with model: {self._settings.model}")
 
-    async def set_language(self, language: Language):
-        """Set the language for the STT service.
+    async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
+        """Apply a settings delta and sync internal state.
 
         Args:
-            language: Target language for transcription.
-        """
-        logger.info(f"Switching STT language to: [{language}]")
-        self._language_enum = language
-        self._language = self.language_to_service_language(language) or "en-US"
-        self._settings["language"] = language
+            delta: A :class:`STTSettings` (or ``NvidiaSegmentedSTTService.Settings``) delta.
 
-        # Update configuration with new language
-        if self._config:
-            self._config.language_code = self._language
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(_migrate_diarization_max_speakers(delta))
+
+        if changed:
+            self._config = self._create_recognition_config()
+
+        return changed
 
     @traced_stt
     async def _handle_transcription(
-        self, transcript: str, is_final: bool, language: Optional[Language] = None
+        self, transcript: str, is_final: bool, language: Language | None = None
     ):
         """Handle a transcription result with tracing."""
         pass
 
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Transcribe an audio segment.
 
         Args:
@@ -599,65 +1024,65 @@ class NvidiaSegmentedSTTService(SegmentedSTTService):
             Frame: TranscriptionFrame containing the transcribed text.
         """
         try:
-            await self.start_processing_metrics()
-            await self.start_ttfb_metrics()
-
-            # Make sure the client is initialized
-            if self._asr_service is None:
-                self._initialize_client()
-
-            # Make sure the config is created
-            if self._config is None:
-                self._config = self._create_recognition_config()
-
-            # Type assertion to satisfy the IDE
             assert self._asr_service is not None, "ASR service not initialized"
             assert self._config is not None, "Recognition config not created"
 
-            # Process audio with NVIDIA Riva ASR - explicitly request non-future response
+            await self.start_processing_metrics()
+
+            # Process audio with NVIDIA Nemotron Speech ASR - explicitly request non-future response
             raw_response = self._asr_service.offline_recognize(audio, self._config, future=False)
 
-            await self.stop_ttfb_metrics()
             await self.stop_processing_metrics()
 
             # Process the response - handle different possible return types
-            try:
-                # If it's a future-like object, get the result
-                if hasattr(raw_response, "result"):
-                    response = raw_response.result()
-                else:
-                    response = raw_response
+            # If it's a future-like object, get the result
+            if hasattr(raw_response, "result"):
+                response = raw_response.result()
+            else:
+                response = raw_response
 
-                # Process transcription results
-                transcription_found = False
+            # Process transcription results
+            transcription_found = False
 
-                # Now we can safely check results
-                # Type hint for the IDE
-                results = getattr(response, "results", [])
+            # Now we can safely check results
+            # Type hint for the IDE
+            results = getattr(response, "results", [])
 
-                for result in results:
-                    alternatives = getattr(result, "alternatives", [])
-                    if alternatives:
-                        text = alternatives[0].transcript.strip()
-                        if text:
-                            logger.debug(f"Transcription: [{text}]")
+            for result in results:
+                alternatives = getattr(result, "alternatives", [])
+                if alternatives:
+                    text = alternatives[0].transcript.strip()
+                    if text:
+                        logger.debug(f"Transcription: [{text}]")
+                        # Technically `_settings.language` could be a raw string, but
+                        # Language is a StrEnum so downstream handles either.
+                        language = cast("Language | None", assert_given(self._settings.language))
+                        await self._handle_transcription(text, True, language)
+                        words = (
+                            _speaker_tagged_words(alternatives[0])
+                            if self._settings.speaker_diarization
+                            else None
+                        )
+                        timestamp = time_now_iso8601()
+                        for speaker, run_text in self._diarized_runs(text, words):
                             yield TranscriptionFrame(
-                                text,
+                                run_text,
                                 self._user_id,
-                                time_now_iso8601(),
-                                self._language_enum,
+                                timestamp,
+                                language,
+                                speaker=speaker,
                             )
-                            transcription_found = True
+                        transcription_found = True
 
-                            await self._handle_transcription(text, True, self._language_enum)
-
-                if not transcription_found:
-                    logger.debug("No transcription results found in NVIDIA Riva response")
-
-            except AttributeError as ae:
-                logger.error(f"Unexpected response structure from NVIDIA Riva: {ae}")
-                yield ErrorFrame(f"Unexpected NVIDIA Riva response format: {str(ae)}")
-
+            if not transcription_found:
+                logger.debug(
+                    f"{self}: No transcription results found in NVIDIA Nemotron Speech response"
+                )
+        except AttributeError as ae:
+            logger.error(f"{self}: Unexpected response structure from NVIDIA Nemotron Speech: {ae}")
+            yield ErrorFrame(
+                error=f"{self}: Unexpected NVIDIA Nemotron Speech response format: {str(ae)}"
+            )
         except Exception as e:
             logger.error(f"{self} exception: {e}")
             yield ErrorFrame(error=f"{self} error: {e}")

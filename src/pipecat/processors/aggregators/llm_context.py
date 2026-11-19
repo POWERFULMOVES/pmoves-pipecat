@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -16,35 +16,59 @@ service-specific adapter.
 
 import asyncio
 import base64
-import io
-import wave
+import copy
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, TypeAlias, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    TypeAlias,
+    cast,
+    overload,
+)
 
 from loguru import logger
-from openai._types import NOT_GIVEN as OPEN_AI_NOT_GIVEN
-from openai._types import NotGiven as OpenAINotGiven
-from openai.types.chat import (
-    ChatCompletionMessageParam,
-    ChatCompletionToolChoiceOptionParam,
-)
-from PIL import Image
 
-from pipecat.adapters.schemas.tools_schema import AdapterType, ToolsSchema
-from pipecat.frames.frames import AudioRawFrame
+from pipecat.adapters.llm.schemas.direct_function import DirectFunction
+from pipecat.adapters.llm.schemas.function_schema import FunctionSchema
+from pipecat.adapters.llm.schemas.tools_schema import ToolsSchema
+from pipecat.audio.utils import pcm_to_wav
+from pipecat.frames.frames import AudioRawFrame, FileSourceType
+from pipecat.utils.image import encode_image
 
-if TYPE_CHECKING:
-    from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+# The sentinel is part of LLMContext's public surface — tools and tool_choice
+# default to it — so it is re-exported here for callers. The redundant aliases
+# mark that intent; a plain import would look unused and be stripped.
+from pipecat.utils.types import NOT_GIVEN as NOT_GIVEN
+from pipecat.utils.types import NotGiven as NotGiven
+from pipecat.utils.types import is_given as is_given
 
 # "Re-export" types from OpenAI that we're using as universal context types.
-# NOTE: if universal message types need to someday diverge from OpenAI's, we
-# should consider managing our own definitions. But we should do so carefully,
-# as the OpenAI messages are somewhat of a standard and we want to continue
-# supporting them.
-LLMStandardMessage = ChatCompletionMessageParam
-LLMContextToolChoice = ChatCompletionToolChoiceOptionParam
-NOT_GIVEN = OPEN_AI_NOT_GIVEN
-NotGiven = OpenAINotGiven
+# NOTE: these are aliased to OpenAI's for type checking, but callers should
+# treat them as LLMContext's own types — independent definitions that happen to
+# coincide with OpenAI's as an implementation detail. If universal context types
+# need to someday diverge from OpenAI's, we should consider managing our own
+# definitions (but with care, since OpenAI's types are somewhat of a standard
+# and we want to continue supporting them). In the meantime, code at the
+# LLMContext/OpenAI boundary should use explicit casts rather than rely on
+# the aliasing.
+#
+# The aliases resolve under type checking only. Every LLM service reaches this
+# module, so importing the OpenAI SDK here would put its load on the startup
+# path of pipelines that never talk to OpenAI. At runtime both are structurally
+# dicts or strings, which is all the annotations need them to be.
+if TYPE_CHECKING:
+    from openai.types.chat import (
+        ChatCompletionMessageParam,
+        ChatCompletionToolChoiceOptionParam,
+    )
+
+    LLMStandardMessage: TypeAlias = ChatCompletionMessageParam
+    LLMContextToolChoice: TypeAlias = ChatCompletionToolChoiceOptionParam
+else:
+    LLMStandardMessage: TypeAlias = Any
+    LLMContextToolChoice: TypeAlias = Any
 
 
 @dataclass
@@ -59,7 +83,31 @@ class LLMSpecificMessage:
     message: Any
 
 
-LLMContextMessage: TypeAlias = Union[LLMStandardMessage, LLMSpecificMessage]
+LLMContextMessage: TypeAlias = LLMStandardMessage | LLMSpecificMessage
+
+
+def standard_message_text(message: LLMContextMessage) -> str:
+    """Return the text of a standard context message, joining the text parts of list content.
+
+    Args:
+        message: A context message.
+
+    Returns:
+        The text, or ``""`` for a message in a service's own format or one
+        that carries no text.
+    """
+    if isinstance(message, LLMSpecificMessage):
+        return ""
+    content = message.get("content")  # type: ignore[attr-defined]
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        )
+    return ""
 
 
 class LLMContext:
@@ -70,48 +118,26 @@ class LLMContext:
     and content formatting.
     """
 
-    @staticmethod
-    def from_openai_context(openai_context: "OpenAILLMContext") -> "LLMContext":
-        """Create a universal LLM context from an OpenAI-specific context.
-
-        NOTE: this should only be used internally, for facilitating migration
-        from OpenAILLMContext to LLMContext. New user code should use
-        LLMContext directly.
-
-        Args:
-            openai_context: The OpenAI LLM context to convert.
-
-        Returns:
-            New LLMContext instance with converted messages and settings.
-        """
-        # Convert tools to ToolsSchema if needed.
-        # If the tools are already a ToolsSchema, this is a no-op.
-        # Otherwise, we wrap them in a shim ToolsSchema.
-        converted_tools = openai_context.tools
-        if isinstance(converted_tools, list):
-            converted_tools = ToolsSchema(
-                standard_tools=[], custom_tools={AdapterType.SHIM: converted_tools}
-            )
-        return LLMContext(
-            messages=openai_context.get_messages(),
-            tools=converted_tools,
-            tool_choice=openai_context.tool_choice,
-        )
-
     def __init__(
         self,
-        messages: Optional[List[LLMContextMessage]] = None,
-        tools: ToolsSchema | NotGiven = NOT_GIVEN,
+        messages: list[LLMContextMessage] | None = None,
+        tools: ToolsSchema | list[FunctionSchema | DirectFunction] | NotGiven = NOT_GIVEN,
         tool_choice: LLMContextToolChoice | NotGiven = NOT_GIVEN,
     ):
         """Initialize the LLM context.
 
         Args:
             messages: Initial list of conversation messages.
-            tools: Available tools for the LLM to use.
+            tools: Available tools for the LLM to use. May be a ``ToolsSchema``
+                or a plain list of direct functions and/or ``FunctionSchema``
+                objects (normalized to a ``ToolsSchema`` internally). Any tool
+                that carries a handler — a direct function, or a
+                ``FunctionSchema`` with its ``handler`` set — is registered with
+                the LLM service automatically, so no separate
+                ``register_function`` call is needed.
             tool_choice: Tool selection strategy for the LLM.
         """
-        self._messages: List[LLMContextMessage] = messages if messages else []
+        self._messages: list[LLMContextMessage] = messages if messages else []
         self._tools: ToolsSchema | NotGiven = LLMContext._normalize_and_validate_tools(tools)
         self._tool_choice: LLMContextToolChoice | NotGiven = tool_choice
 
@@ -120,7 +146,7 @@ class LLMContext:
         *,
         role: str = "user",
         url: str,
-        text: Optional[str] = None,
+        text: str | None = None,
     ) -> LLMContextMessage:
         """Create a context message containing an image URL.
 
@@ -129,13 +155,16 @@ class LLMContext:
             url: The URL of the image.
             text: Optional text to include with the image.
         """
-        content = []
+        # TODO: Deprecate support for a non-data `url` here now that `create_file_url_message`
+        #       exists — a URL-referenced image and a URL-referenced file should go through the
+        #       same path instead of two.
+        content: list[dict[str, Any]] = []
         if text:
             content.append({"type": "text", "text": text})
 
         content.append({"type": "image_url", "image_url": {"url": url}})
 
-        return {"role": role, "content": content}
+        return cast(LLMContextMessage, {"role": role, "content": content})
 
     @staticmethod
     async def create_image_message(
@@ -144,7 +173,7 @@ class LLMContext:
         format: str,
         size: tuple[int, int],
         image: bytes,
-        text: Optional[str] = None,
+        text: str | None = None,
     ) -> LLMContextMessage:
         """Create a context message containing an image.
 
@@ -156,25 +185,76 @@ class LLMContext:
             image: Raw image bytes.
             text: Optional text to include with the image.
         """
-        # Format is a mime type: image is already encoded
-        image_already_encoded = format.startswith("image/")
+        data, content_type = await encode_image(image, size, format)
+        encoded_image = base64.b64encode(data).decode("utf-8")
 
-        def encode_image():
-            if image_already_encoded:
-                bytes = image
-            else:
-                # Encode to JPEG
-                buffer = io.BytesIO()
-                Image.frombytes(format, size, image).save(buffer, format="JPEG")
-                bytes = buffer.getvalue()
-            encoded_image = base64.b64encode(bytes).decode("utf-8")
-            return encoded_image
-
-        encoded_image = await asyncio.to_thread(encode_image)
-
-        url = f"data:{format if image_already_encoded else 'image/jpeg'};base64,{encoded_image}"
+        url = f"data:{content_type};base64,{encoded_image}"
 
         return LLMContext.create_image_url_message(role=role, url=url, text=text)
+
+    @staticmethod
+    async def create_file_message(
+        *,
+        role: str = "user",
+        type: FileSourceType,
+        format: str,
+        file: str,
+        name: str | None = None,
+        text: str | None = None,
+    ) -> LLMContextMessage:
+        """Create a context message containing a file.
+
+        Args:
+            role: The role of this message (defaults to "user").
+            type: The type of the file.
+            format: MIME type of the file (e.g., "application/pdf").
+            file: Base64 data URL (``data:<mime>;base64,...``) or plain URL string.
+            name: Optional name of the file.
+            text: Optional text to include with the file.
+        """
+        # The URL is stored unresolved; at completion time the LLM service
+        # either passes it to the provider to fetch itself or downloads it via
+        # its FileResolver, depending on what the provider can consume.
+        if type == "url":
+            return LLMContext.create_file_url_message(
+                role=role, format=format, url=file, filename=name, text=text
+            )
+
+        content: list[dict[str, Any]] = []
+        if text:
+            content.append({"type": "text", "text": text})
+
+        file_m = {"file_data": file, "filename": name if name else "", "mime_type": format}
+        content.append({"type": "file_base64", "file": file_m})
+
+        return cast(LLMContextMessage, {"role": role, "content": content})
+
+    @staticmethod
+    def create_file_url_message(
+        *,
+        role: str = "user",
+        format: str,
+        url: str,
+        filename: str | None = None,
+        text: str | None = None,
+    ) -> LLMContextMessage:
+        """Create a context message containing a image or file URL.
+
+        Args:
+            role: The role of this message (defaults to "user").
+            format: The MIME type of the file (e.g., 'application/pdf').
+            url: The URL of the image or file.
+            filename: Optional name of the file.
+            text: Optional text to include with the image or file.
+        """
+        content: list[dict[str, Any]] = []
+        if text:
+            content.append({"type": "text", "text": text})
+
+        file_m = {"url": url, "filename": filename if filename else "", "mime_type": format}
+        content.append({"type": "file_url", "file": file_m})
+
+        return cast(LLMContextMessage, {"role": role, "content": content})
 
     @staticmethod
     async def create_audio_message(
@@ -187,23 +267,16 @@ class LLMContext:
             audio_frames: List of audio frame objects to include.
             text: Optional text to include with the audio.
         """
-        content = [{"type": "text", "text": text}]
+        content: list[dict[str, Any]] = [{"type": "text", "text": text}]
 
-        async def encode_audio():
+        def encode_audio():
             sample_rate = audio_frames[0].sample_rate
             num_channels = audio_frames[0].num_channels
 
             data = b"".join(frame.audio for frame in audio_frames)
 
-            with io.BytesIO() as buffer:
-                with wave.open(buffer, "wb") as wf:
-                    wf.setsampwidth(2)
-                    wf.setnchannels(num_channels)
-                    wf.setframerate(sample_rate)
-                    wf.writeframes(data)
-
-                encoded_audio = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            return encoded_audio
+            wav = pcm_to_wav(data, sample_rate, num_channels)
+            return base64.b64encode(wav).decode("utf-8")
 
         encoded_audio = await asyncio.to_thread(encode_audio)
 
@@ -214,10 +287,10 @@ class LLMContext:
             }
         )
 
-        return {"role": role, "content": content}
+        return cast(LLMContextMessage, {"role": role, "content": content})
 
     @property
-    def messages(self) -> List[LLMContextMessage]:
+    def messages(self) -> list[LLMContextMessage]:
         """Get the current messages list.
 
         NOTE: This is equivalent to calling `get_messages()` with no filter. If
@@ -229,34 +302,12 @@ class LLMContext:
         """
         return self.get_messages()
 
-    def get_messages_for_persistent_storage(self) -> List[LLMContextMessage]:
-        """Get messages suitable for persistent storage.
-
-        NOTE: the only reason this method exists is because we're "silently"
-        switching from OpenAILLMContext to LLMContext under the hood in some
-        services and don't want to trip up users who may have been relying on
-        this method, which is part of the public API of OpenAILLMContext but
-        doesn't need to be for LLMContext.
-
-        .. deprecated::
-            Use `get_messages()` instead.
-
-        Returns:
-            List of conversation messages.
-        """
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("always")
-            warnings.warn(
-                "get_messages_for_persistent_storage() is deprecated, use get_messages() instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        return self.get_messages()
-
-    def get_messages(self, llm_specific_filter: Optional[str] = None) -> List[LLMContextMessage]:
+    def get_messages(
+        self,
+        llm_specific_filter: str | None = None,
+        *,
+        truncate_large_values: bool = False,
+    ) -> list[LLMContextMessage]:
         """Get the current messages list.
 
         Args:
@@ -265,22 +316,117 @@ class LLMContext:
                 messages. If messages end up being filtered, an error will be
                 logged; this is intended to catch accidental use of
                 incompatible LLM-specific messages.
+            truncate_large_values: If True, return deep copies of messages with
+                large values shortened. For standard messages, known binary
+                data (base64-encoded images, audio) is replaced with short
+                placeholders. For LLM-specific messages, long string values
+                are truncated.
 
         Returns:
             List of conversation messages.
         """
         if llm_specific_filter is None:
-            return self._messages
-        filtered_messages = [
-            msg
-            for msg in self._messages
-            if not isinstance(msg, LLMSpecificMessage) or msg.llm == llm_specific_filter
-        ]
-        if len(filtered_messages) < len(self._messages):
-            logger.error(
-                f"Attempted to use incompatible LLMSpecificMessages with LLM '{llm_specific_filter}'."
-            )
-        return filtered_messages
+            messages = self._messages
+        else:
+            messages = [
+                msg
+                for msg in self._messages
+                if not isinstance(msg, LLMSpecificMessage) or msg.llm == llm_specific_filter
+            ]
+            if len(messages) < len(self._messages):
+                logger.error(
+                    f"Attempted to use incompatible LLMSpecificMessages with LLM '{llm_specific_filter}'."
+                )
+
+        if truncate_large_values:
+            messages = LLMContext._truncate_large_values_from_messages(messages)
+
+        return messages
+
+    @staticmethod
+    def _truncate_large_values_from_messages(
+        messages: list[LLMContextMessage],
+    ) -> list[LLMContextMessage]:
+        """Return deep copies of messages with large values replaced by placeholders.
+
+        For standard (universal-format) messages, the following known binary
+        patterns are replaced with short placeholders:
+
+        - ``image_url`` items with ``data:image/...`` base64 URLs
+        - ``input_audio`` items with ``input_audio.data`` or ``audio`` fields
+        - ``audio`` items with an ``audio`` field
+        - Top-level messages with a ``mime_type`` starting with ``image/``
+
+        For ``LLMSpecificMessage`` instances, long string values are truncated
+        since the internal structure is provider-specific.
+        """
+        result = []
+        for message in messages:
+            if isinstance(message, LLMSpecificMessage):
+                msg_copy = copy.deepcopy(message)
+                msg_copy.message = LLMContext._truncate_long_strings(msg_copy.message)
+                result.append(msg_copy)
+                continue
+
+            # The standard message variant is a union of TypedDicts; the
+            # mutations below operate on plain dicts at runtime. Treat as
+            # such for the duration of the redaction loop.
+            msg: dict[str, Any] = cast(dict[str, Any], copy.deepcopy(message))
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    item_type = item.get("type")
+                    if item_type == "image_url":
+                        url = item.get("image_url", {}).get("url", "")
+                        if url.startswith("data:image/"):
+                            item["image_url"]["url"] = "data:image/..."
+                    elif item_type == "input_audio":
+                        if "input_audio" in item:
+                            item["input_audio"]["data"] = "..."
+                        if "audio" in item:
+                            item["audio"] = "..."
+                    elif item_type == "audio":
+                        if "audio" in item:
+                            item["audio"] = "..."
+                    elif item_type == "file_base64":
+                        if "file" in item:
+                            item["file"]["file_data"] = "..."
+                            item["file"].pop("_raw_bytes", None)
+
+            if msg.get("mime_type", "").startswith("image/"):
+                msg["data"] = "..."
+
+            result.append(msg)
+        return result
+
+    @staticmethod
+    def _truncate_long_strings(value: Any, *, max_length: int = 100) -> Any:
+        """Recursively truncate long strings in a nested structure.
+
+        Preserves the structure of dicts and lists while truncating any string
+        values that exceed ``max_length``.
+
+        Args:
+            value: The value to process (dict, list, str, or other).
+            max_length: Strings longer than this are truncated.
+
+        Returns:
+            A copy of the structure with long strings truncated.
+        """
+        if isinstance(value, str):
+            if len(value) > max_length:
+                return f"{value[:max_length]}...({len(value)} chars)"
+            return value
+        elif isinstance(value, dict):
+            return {
+                k: LLMContext._truncate_long_strings(v, max_length=max_length)
+                for k, v in value.items()
+            }
+        elif isinstance(value, list):
+            return [
+                LLMContext._truncate_long_strings(item, max_length=max_length) for item in value
+            ]
+        return value
 
     @property
     def tools(self) -> ToolsSchema | NotGiven:
@@ -308,7 +454,7 @@ class LLMContext:
         """
         self._messages.append(message)
 
-    def add_messages(self, messages: List[LLMContextMessage]):
+    def add_messages(self, messages: list[LLMContextMessage]):
         """Add multiple messages to the context.
 
         Args:
@@ -316,7 +462,7 @@ class LLMContext:
         """
         self._messages.extend(messages)
 
-    def set_messages(self, messages: List[LLMContextMessage]):
+    def set_messages(self, messages: list[LLMContextMessage]):
         """Replace all messages in the context.
 
         Args:
@@ -324,11 +470,26 @@ class LLMContext:
         """
         self._messages[:] = messages
 
-    def set_tools(self, tools: ToolsSchema | NotGiven = NOT_GIVEN):
+    def transform_messages(
+        self, transform: Callable[[list[LLMContextMessage]], list[LLMContextMessage]]
+    ):
+        """Transform the current messages using the provided function.
+
+        Args:
+            transform: A function that takes the current list of messages and returns
+                a modified list of messages to set in the context.
+        """
+        self.set_messages(transform(self._messages))
+
+    def set_tools(
+        self,
+        tools: ToolsSchema | list[FunctionSchema | DirectFunction] | NotGiven = NOT_GIVEN,
+    ):
         """Set the available tools for the LLM.
 
         Args:
-            tools: A ToolsSchema or NOT_GIVEN to disable tools.
+            tools: A ToolsSchema, a plain list of direct functions and/or
+                ``FunctionSchema`` objects, or NOT_GIVEN to disable tools.
         """
         self._tools = LLMContext._normalize_and_validate_tools(tools)
 
@@ -346,7 +507,7 @@ class LLMContext:
         format: str,
         size: tuple[int, int],
         image: bytes,
-        text: Optional[str] = None,
+        text: str | None = None,
         role: str = "user",
     ):
         """Add a message containing an image frame.
@@ -364,6 +525,33 @@ class LLMContext:
         )
         self.add_message(message)
 
+    async def add_file_frame_message(
+        self,
+        *,
+        type: FileSourceType,
+        format: str,
+        file: str,
+        text: str | None = None,
+        name: str | None = None,
+        role: str = "user",
+    ):
+        """Add a message containing a file frame.
+
+        Args:
+            type: File source type.
+            format: MIME type of the file (e.g., 'application/pdf').
+            file: Base64 data URL (``data:<mime>;base64,...``) or plain URL string.
+                URL fetching for providers that require bytes is handled by the
+                provider adapter during message conversion.
+            text: Optional text to accompany the file.
+            name: Optional file name.
+            role: Message role (defaults to 'user').
+        """
+        message = await LLMContext.create_file_message(
+            role=role, type=type, format=format, file=file, name=name, text=text
+        )
+        self.add_message(message)
+
     async def add_audio_frames_message(
         self, *, audio_frames: list[AudioRawFrame], text: str = "Audio follows"
     ):
@@ -376,13 +564,110 @@ class LLMContext:
         message = await LLMContext.create_audio_message(audio_frames=audio_frames, text=text)
         self.add_message(message)
 
+    def remove_invalid_file_message(self) -> bool:
+        """Remove the oldest file or image message added since the model's last successful reply.
+
+        Best-effort cleanup for an LLM service to call once it's determined
+        (from a provider-specific error) that a request was rejected due to
+        unsupported or malformed file content — e.g. an unsupported MIME type,
+        corrupt bytes, or an image whose bytes don't match its declared media
+        type. Removing it prevents the context from getting permanently stuck
+        retrying the same failure. Images count as files here: both are
+        discrete client-supplied attachments a provider can reject the same
+        way. Audio content deliberately doesn't — audio-in-context flows
+        append audio as ordinary conversation every turn, so removing the
+        oldest audio message on an unrelated rejection would discard real
+        conversation rather than a bad attachment.
+
+        Providers don't say which message or content item triggered the
+        rejection, so there's no way to identify the exact culprit — this is
+        a heuristic, not a precise fix. An assistant message proves
+        everything before it was already accepted by a prior successful
+        completion (assistant messages are only ever appended after a
+        completion succeeds), so only file messages added since the last one
+        are candidates — a file from an earlier, already-successful turn is
+        never at risk. If several files are candidates (e.g. sent in quick
+        succession before either went through a completion), only the oldest
+        is removed: if it wasn't the actual culprit, the next retry fails
+        again and removes the next-oldest, converging on the bad file within
+        a few retries without ever knowing which one the provider meant.
+
+        Returns:
+            True if a file or image message was found and removed.
+        """
+        since_index = 0
+        for i in range(len(self._messages) - 1, -1, -1):
+            message = self._messages[i]
+            if not isinstance(message, LLMSpecificMessage) and message.get("role") == "assistant":
+                since_index = i + 1
+                break
+
+        for i in range(since_index, len(self._messages)):
+            message = self._messages[i]
+            if isinstance(message, LLMSpecificMessage):
+                continue
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(item, dict)
+                and item.get("type") in ("file_base64", "file_url", "image_url")
+                for item in content
+            ):
+                logger.warning(
+                    "Removing message with file or image content from context due to "
+                    "invalid response."
+                )
+                self._messages.pop(i)
+                return True
+        return False
+
+    @overload
     @staticmethod
-    def _normalize_and_validate_tools(tools: ToolsSchema | NotGiven) -> ToolsSchema | NotGiven:
+    def _normalize_and_validate_tools(
+        tools: ToolsSchema | list[FunctionSchema | DirectFunction] | NotGiven,
+        *,
+        allow_provider_tools: Literal[False] = False,
+    ) -> ToolsSchema | NotGiven: ...
+
+    @overload
+    @staticmethod
+    def _normalize_and_validate_tools(
+        tools: ToolsSchema | list[Any] | NotGiven,
+        *,
+        allow_provider_tools: Literal[True],
+    ) -> ToolsSchema | list[Any] | NotGiven: ...
+
+    @staticmethod
+    def _normalize_and_validate_tools(
+        tools: ToolsSchema | list[Any] | NotGiven,
+        *,
+        allow_provider_tools: bool = False,
+    ) -> ToolsSchema | list[Any] | NotGiven:
         """Normalize and validate the given tools.
 
+        A plain list of direct functions and/or ``FunctionSchema`` objects is
+        wrapped in a ``ToolsSchema``.
+
+        Args:
+            tools: The tools to normalize: a ``ToolsSchema``, a list of direct
+                functions and/or ``FunctionSchema`` objects, or ``NOT_GIVEN``.
+            allow_provider_tools: If True, a list that isn't entirely standard
+                tools (direct functions / ``FunctionSchema`` objects) is taken to
+                be already-formatted, provider-native tools and returned
+                unchanged rather than raising. For callers whose tools parameter
+                accepts provider-native tools alongside standard ones.
+
         Raises:
-            TypeError: If tools are not a ToolsSchema or NotGiven.
+            TypeError: If tools aren't a ``ToolsSchema``, list, or ``NOT_GIVEN`` —
+                or, unless ``allow_provider_tools`` is set, if a list contains
+                anything other than standard tools.
         """
+        if isinstance(tools, list):
+            if allow_provider_tools and not all(
+                isinstance(t, FunctionSchema) or callable(t) for t in tools
+            ):
+                # Already-formatted, provider-native tools; pass through unchanged.
+                return tools
+            tools = ToolsSchema(standard_tools=tools)
         if isinstance(tools, ToolsSchema):
             if not tools.standard_tools and not tools.custom_tools:
                 return NOT_GIVEN
@@ -391,5 +676,6 @@ class LLMContext:
             return NOT_GIVEN
         else:
             raise TypeError(
-                f"In LLMContext, tools must be a ToolsSchema object or NOT_GIVEN. Got type: {type(tools)}",
+                "In LLMContext, tools must be a ToolsSchema, a list of direct functions / "
+                f"FunctionSchema objects, or NOT_GIVEN. Got type: {type(tools)}",
             )

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2024–2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -14,16 +14,17 @@ import numpy as np
 from loguru import logger
 
 from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
+from pipecat.audio.resamplers.base_audio_resampler import SoxrQuality
+from pipecat.audio.utils import create_stream_resampler
 from pipecat.frames.frames import FilterControlFrame, FilterEnableFrame
+from pipecat.utils.deprecation import warn_deprecated
 
 try:
     from pyrnnoise import RNNoise
 except ModuleNotFoundError as e:
     RNNoise = None
     logger.error(f"Exception: {e}")
-    logger.error(
-        "In order to use the RNNoise filter, you need to `pip install pipecat-ai[rnnoise]`."
-    )
+    logger.error('In order to use the RNNoise filter, you need to `uv add "pipecat-ai[rnnoise]"`.')
 
 
 class RNNoiseFilter(BaseAudioFilter):
@@ -35,21 +36,29 @@ class RNNoiseFilter(BaseAudioFilter):
     processes it in chunks.
     """
 
-    def __init__(self, resampler_quality: str = "QQ") -> None:
+    def __init__(self, resampler_quality: SoxrQuality | None = None) -> None:
         """Initialize the RNNoise noise suppression filter.
 
         Args:
-            resampler_quality: Quality of the resampler if resampling is needed.
-                               One of "VHQ", "HQ", "MQ", "LQ", "QQ". Defaults to "QQ"
-                               (Quick) for lowest latency.
+            resampler_quality: Has no effect: the filter resamples to and from
+                48 kHz with :func:`~pipecat.audio.utils.create_stream_resampler`.
+
+                .. deprecated:: 1.16.0
+                    No replacement. Will be removed in 2.0.0.
         """
+        if resampler_quality is not None:
+            warn_deprecated(
+                "`RNNoiseFilter(resampler_quality=...)` is deprecated since 1.16.0 and will be "
+                "removed in 2.0.0. No replacement. It has no effect: the filter resamples with "
+                "`create_stream_resampler()`.",
+                stacklevel=2,
+            )
         self._filtering = True
         self._sample_rate = 0
         self._rnnoise = None
         self._rnnoise_ready = False
         self._resampler_in = None
         self._resampler_out = None
-        self._resampler_quality = resampler_quality
 
     async def start(self, sample_rate: int):
         """Initialize the filter with the transport's sample rate.
@@ -60,7 +69,12 @@ class RNNoiseFilter(BaseAudioFilter):
         self._sample_rate = sample_rate
 
         try:
-            # RNNoise always requires 48kHz
+            # The module-level import sets `RNNoise` to `None` if pyrnnoise
+            # isn't installed; raise instead of calling `None(...)` so the
+            # except clause handles it cleanly.
+            if RNNoise is None:
+                raise ImportError("pyrnnoise is not installed")
+            # RNNoise always requires 48kHz.
             self._rnnoise = RNNoise(sample_rate=48000)
             self._rnnoise_ready = True
         except Exception as e:
@@ -70,14 +84,8 @@ class RNNoiseFilter(BaseAudioFilter):
 
         if self._sample_rate != 48000:
             logger.info(f"RNNoise filter enabling resampling: {self._sample_rate} <-> 48000")
-            try:
-                from pipecat.audio.resamplers.soxr_stream_resampler import SOXRStreamAudioResampler
-
-                self._resampler_in = SOXRStreamAudioResampler(quality=self._resampler_quality)
-                self._resampler_out = SOXRStreamAudioResampler(quality=self._resampler_quality)
-            except ImportError as e:
-                logger.error(f"Could not import SOXRStreamAudioResampler for resampling: {e}")
-                self._rnnoise_ready = False
+            self._resampler_in = create_stream_resampler()
+            self._resampler_out = create_stream_resampler()
 
     async def stop(self):
         """Clean up the RNNoise engine when stopping."""
@@ -93,6 +101,8 @@ class RNNoiseFilter(BaseAudioFilter):
             frame: The control frame containing filter commands.
         """
         if isinstance(frame, FilterEnableFrame):
+            if frame.enable and not self._filtering:
+                await self._reset_resamplers()
             self._filtering = frame.enable
 
     async def filter(self, audio: bytes) -> bytes:
@@ -107,13 +117,17 @@ class RNNoiseFilter(BaseAudioFilter):
         Returns:
             Noise-suppressed audio data as bytes.
         """
-        if not self._rnnoise_ready or not self._filtering:
+        if not self._rnnoise_ready or not self._filtering or self._rnnoise is None:
             return audio
 
         # Resample input if needed
         in_audio = audio
         if self._sample_rate != 48000 and self._resampler_in:
             in_audio = await self._resampler_in.resample(audio, self._sample_rate, 48000)
+
+        # If audio is empty, return empty bytes (no point in noise cancellation)
+        if len(in_audio) == 0:
+            return b""
 
         # Convert bytes to numpy array (int16)
         audio_samples = np.frombuffer(in_audio, dtype=np.int16)
@@ -148,3 +162,9 @@ class RNNoiseFilter(BaseAudioFilter):
 
         # No frames processed yet (buffering)
         return b""
+
+    async def _reset_resamplers(self):
+        """Discard the audio the resamplers held when filtering was turned off."""
+        for resampler in (self._resampler_in, self._resampler_out):
+            if resampler:
+                await resampler.reset()

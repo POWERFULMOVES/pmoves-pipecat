@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2025, Daily
+# Copyright (c) 2024-2026, Daily
 #
 # SPDX-License-Identifier: BSD 2-Clause License
 #
@@ -7,12 +7,11 @@
 """Utility functions for extracting probability metrics from STT services."""
 
 import math
-from typing import Optional
 
 from pipecat.frames.frames import TranscriptionFrame
 
 
-def extract_whisper_probability(frame: TranscriptionFrame) -> Optional[float]:
+def extract_whisper_probability(frame: TranscriptionFrame) -> float | None:
     """Extract probability from Whisper-based TranscriptionFrame result.
 
     Works with Groq, OpenAI Whisper, or other Whisper-based services that use
@@ -29,10 +28,12 @@ def extract_whisper_probability(frame: TranscriptionFrame) -> Optional[float]:
 
     Example::
 
+        import os
+
         from pipecat.services.groq.stt import GroqSTTService
         from pipecat.services.whisper.utils import extract_whisper_probability
 
-        stt = GroqSTTService(include_prob_metrics=True)
+        stt = GroqSTTService(api_key=os.getenv("GROQ_API_KEY"), include_prob_metrics=True)
         # ... use stt in pipeline ...
         # In your frame processor:
         if isinstance(frame, TranscriptionFrame):
@@ -53,12 +54,12 @@ def extract_whisper_probability(frame: TranscriptionFrame) -> Optional[float]:
     return None
 
 
-def extract_openai_gpt4o_probability(frame: TranscriptionFrame) -> Optional[float]:
+def extract_openai_gpt4o_probability(frame: TranscriptionFrame) -> float | None:
     """Extract probability from OpenAI GPT-4o-transcribe TranscriptionFrame result.
 
     Args:
         frame: TranscriptionFrame with result from OpenAISTTService
-            using GPT-4o-transcribe model (when include_prob_metrics=True).
+            using a GPT transcription model (when include_prob_metrics=True).
 
     Returns:
         Probability (0-1) if available, None otherwise.
@@ -68,7 +69,7 @@ def extract_openai_gpt4o_probability(frame: TranscriptionFrame) -> Optional[floa
         from pipecat.services.openai.stt import OpenAISTTService
         from pipecat.services.whisper.utils import extract_openai_gpt4o_probability
 
-        stt = OpenAISTTService(model="gpt-4o-transcribe", include_prob_metrics=True)
+        stt = OpenAISTTService(include_prob_metrics=True)
         # ... use stt in pipeline ...
         # In your frame processor:
         if isinstance(frame, TranscriptionFrame):
@@ -79,7 +80,7 @@ def extract_openai_gpt4o_probability(frame: TranscriptionFrame) -> Optional[floa
     if not frame.result:
         return None
 
-    # OpenAI GPT-4o-transcribe format: response.logprobs
+    # OpenAI GPT transcription format: response.logprobs
     if hasattr(frame.result, "logprobs"):
         logprobs = frame.result.logprobs
         if logprobs:
@@ -90,7 +91,7 @@ def extract_openai_gpt4o_probability(frame: TranscriptionFrame) -> Optional[floa
     return None
 
 
-def extract_deepgram_probability(frame: TranscriptionFrame) -> Optional[float]:
+def extract_deepgram_probability(frame: TranscriptionFrame) -> float | None:
     """Extract probability from Deepgram TranscriptionFrame result.
 
     Args:
